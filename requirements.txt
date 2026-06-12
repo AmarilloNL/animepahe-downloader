@@ -1,0 +1,9 @@
+# AnimePahe Downloader — Python dependencies
+#
+# After installing these, run:  python -m patchright install chromium
+#
+# Note: Tkinter is part of the Python standard library but on Linux it often
+# needs a system package (e.g. `sudo pacman -S tk` or `sudo apt install python3-tk`).
+
+patchright>=1.40
+beautifulsoup4>=4.12

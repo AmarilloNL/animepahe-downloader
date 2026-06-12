@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# App runtime data (browser profile, logs, downloads)
+.config/
+*.log
+engine.log
+
+# Downloaded media — never commit these
+*.mp4
+*.mkv
+*.part
+Output/
+Downloads/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
