@@ -96,6 +96,11 @@ def _log(msg: str):
 _engine: "BrowserEngine | None" = None
 
 
+class RateLimited(Exception):
+    """Raised when AnimePahe returns HTTP 429 (too many requests)."""
+    pass
+
+
 class BrowserEngine:
     """
     Owns a persistent Playwright Chromium context on its own thread.
@@ -424,8 +429,14 @@ class BrowserEngine:
     def _get(self, url: str) -> tuple[int, str]:
         page = self._main_page()
         resp = self._goto(page, url)
-        self._ensure_clear(page)
         status = resp.status if resp else 0
+        # HTTP 429 = rate limited by AnimePahe. Surface it clearly so the
+        # download loop can back off instead of hammering and getting the
+        # browser context killed.
+        if status == 429:
+            _log("GET: 429 rate limited")
+            raise RateLimited("AnimePahe rate limit (HTTP 429)")
+        self._ensure_clear(page)
         body = page.content()
         pre = page.query_selector("pre")
         if pre:
@@ -597,14 +608,15 @@ class BrowserEngine:
             # On the kwik /f/ page: submit the download form to get the MP4.
             direct = None
             try:
-                page.wait_for_selector("form", timeout=8000)
+                page.wait_for_selector("form", timeout=15000)
             except Exception:
                 pass
 
             # The MP4 may be revealed by submitting the form. Capture whichever
-            # of these fires: a download event, a navigation, or a popup.
+            # of these fires: a download event, a navigation, or a popup. Use a
+            # generous timeout since Kwik can respond slowly when throttling.
             try:
-                with page.expect_download(timeout=15000) as dl:
+                with page.expect_download(timeout=25000) as dl:
                     page.evaluate("(document.querySelector('form')||{submit(){}}).submit()")
                 direct = dl.value.url
                 _log(f"DLRES: got download url {direct[:80]}")
@@ -1568,7 +1580,12 @@ class AnimePaheApp(tk.Tk):
         def run():
             import traceback
             total = len(selected)
-            for idx, item in enumerate(selected):
+            idx = 0
+            rl_strikes = 0     # consecutive rate-limit hits
+            ctx_strikes = 0    # consecutive dead-context hits
+            res_strikes = 0    # consecutive resolve failures (Kwik throttling)
+            while idx < len(selected):
+                item = selected[idx]
                 if self._stop_event.is_set():
                     self.after(0, lambda: self._set_status("Stopped.", WARN))
                     break
@@ -1589,6 +1606,7 @@ class AnimePaheApp(tk.Tk):
                         print(f"[DL] {msg}")
                         self.after(0, lambda n=ep_num, m=msg:
                             self._set_status(m, ERROR))
+                        idx += 1
                         continue
 
                     chosen = pick_download_option(options, self._quality_var.get(), self._audio_var.get())
@@ -1611,11 +1629,31 @@ class AnimePaheApp(tk.Tk):
                     print(f"[DL] resolve result={result!r}")
 
                     if not result:
-                        msg = f"Ep {ep_num}: Could not resolve download URL — skipping."
+                        # Repeated resolve failures usually mean Kwik is throttling
+                        # us after many rapid downloads. Back off (progressively),
+                        # then RETRY the same episode rather than skipping it.
+                        res_strikes += 1
+                        if res_strikes <= 3:
+                            wait_s = min(120, 30 * res_strikes)
+                            print(f"[DL] resolve throttled (strike {res_strikes}); cooling down {wait_s}s then retrying Ep {ep_num}.")
+                            for remaining in range(wait_s, 0, -1):
+                                if self._stop_event.is_set():
+                                    break
+                                self.after(0, lambda r=remaining, n=ep_num:
+                                    self._set_status(f"Links throttled — waiting {r}s before retrying Ep {n}…", WARN))
+                                time.sleep(1)
+                            continue   # retry same episode (idx not advanced)
+                        # Gave it several tries with cooldowns — skip and move on.
+                        msg = f"Ep {ep_num}: Could not resolve after retries — skipping."
                         print(f"[DL] {msg}")
                         self.after(0, lambda n=ep_num, m=msg:
                             self._set_status(m, ERROR))
+                        res_strikes = 0
+                        idx += 1
                         continue
+
+                    # Resolve succeeded — reset the throttle counter.
+                    res_strikes = 0
 
                     direct_url, extra_hdrs = result
                     print(f"[DL] direct_url={direct_url!r}")
@@ -1654,17 +1692,55 @@ class AnimePaheApp(tk.Tk):
                     if not ok:
                         break
 
+                    # success — reset the strike counters and advance
+                    rl_strikes = 0
+                    ctx_strikes = 0
+                    idx += 1
+
+                except RateLimited:
+                    # AnimePahe is rate-limiting us. Wait a while, then RETRY the
+                    # same episode (don't advance idx). Back off progressively.
+                    rl_strikes += 1
+                    wait_s = min(120, 30 * rl_strikes)
+                    print(f"[DL] RATE LIMITED (429). Cooling down {wait_s}s, then retrying Ep {ep_num}.")
+                    for remaining in range(wait_s, 0, -1):
+                        if self._stop_event.is_set():
+                            break
+                        self.after(0, lambda r=remaining, n=ep_num:
+                            self._set_status(f"Rate limited — waiting {r}s before retrying Ep {n}…", WARN))
+                        time.sleep(1)
+                    # do NOT increment idx — retry the same episode
+                    continue
+
                 except Exception as e:
                     tb = traceback.format_exc()
                     print(f"[DL] EXCEPTION for Ep {ep_num}:\n{tb}")
+                    # A dead browser context (TargetClosedError) often follows a
+                    # rate-limit or network drop. Pause so the relaunched browser
+                    # can settle, then retry the SAME episode once before skipping.
+                    if "TargetClosedError" in tb or "Target page" in str(e):
+                        ctx_strikes += 1
+                        if ctx_strikes <= 3:
+                            print(f"[DL] context died, cooldown 15s then retry (strike {ctx_strikes})")
+                            for remaining in range(15, 0, -1):
+                                if self._stop_event.is_set():
+                                    break
+                                self.after(0, lambda r=remaining, n=ep_num:
+                                    self._set_status(f"Browser reset — waiting {r}s before retrying Ep {n}…", WARN))
+                                time.sleep(1)
+                            continue   # retry same episode
                     self.after(0, lambda n=ep_num, err=str(e):
                         self._set_status(f"Ep {n} error: {err}", ERROR))
+                    idx += 1
                     continue
 
-                overall = (idx + 1) / total * 100
+                overall = idx / total * 100
                 self.after(0, lambda v=overall: self._progress.configure(value=v))
 
-            if not self._stop_event.is_set():
+                # Small polite pause between episodes on long batches to avoid
+                # tripping AnimePahe's rate limiter (HTTP 429).
+                if idx < len(selected) and not self._stop_event.is_set():
+                    time.sleep(1.5)
                 self.after(0, lambda: (
                     self._set_status(f"Done! {total} episode(s) saved to {dest}", SUCCESS),
                     self._progress.configure(value=100),
