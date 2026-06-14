@@ -818,6 +818,70 @@ def pw_download(url: str, dest_path: str, extra_headers: dict,
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
+def fetch_latest(page: int = 1) -> tuple[list[dict], bool]:
+    """
+    Browse the 'latest releases' (airing) feed. Returns (results, has_more).
+    Each show may appear more than once as new episodes air, so we dedupe by
+    anime within this page. Results use the same shape as search_anime.
+    """
+    text = pw_get(API_URL, params={"m": "airing", "page": page})
+    stripped = text.lstrip("\ufeff \t\r\n")
+    if stripped[:1] not in ("{", "["):
+        return [], False
+    data = json.loads(stripped)
+    items = data.get("data", []) if isinstance(data, dict) else data
+    results, seen = [], set()
+    for i in items:
+        sid = i.get("anime_session") or i.get("session", "")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        results.append({
+            "id":       sid,
+            "title":    i.get("anime_title", "Unknown"),
+            "year":     "",
+            "status":   f"Ep {i.get('episode', '?')}" + (f" · {i['fansub']}" if i.get("fansub") else ""),
+            "episodes": "?",
+            "type":     "airing",
+        })
+    last_page = data.get("last_page", 1) if isinstance(data, dict) else 1
+    has_more = page < last_page
+    return results, has_more
+
+
+def fetch_catalog(status_cb=None) -> list[dict]:
+    """
+    Browse the full A-Z catalog from the /anime index page. This is one large
+    page listing every title on the site, so we fetch it once and parse out
+    each title + its session id. Results use the same shape as search_anime.
+    """
+    if status_cb:
+        status_cb("Loading full catalog (this can take a few seconds)…")
+    text = pw_get(f"{BASE_URL}/anime")
+    soup = BeautifulSoup(text, "html.parser")
+    results, seen = [], set()
+    # The index lists each anime as <a href="/anime/<session>" title="Name">.
+    for a in soup.select("a[href*='/anime/']"):
+        href = a.get("href", "")
+        m = re.search(r"/anime/([a-f0-9-]{36})", href)
+        if not m:
+            continue
+        sid = m.group(1)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        title = (a.get("title") or a.get_text(strip=True)).strip()
+        if not title:
+            continue
+        results.append({
+            "id": sid, "title": title,
+            "year": "", "status": "", "episodes": "?", "type": "catalog",
+        })
+    # Present them alphabetically for easy browsing.
+    results.sort(key=lambda r: r["title"].lower())
+    return results
+
+
 def search_anime(query: str, status_cb=None) -> list[dict]:
     # Primary: JSON API via in-page fetch
     text = pw_get(API_URL, params={"m": "search", "q": query})
@@ -1183,6 +1247,24 @@ class AnimePaheApp(tk.Tk):
                                      command=self._do_search)
         self._search_btn.grid(row=0, column=1, padx=(8,0))
 
+        self._browse_btn = tk.Button(search_wrap, text="Browse all",
+                                     bg=CARD, fg=ROSE,
+                                     activebackground=BORDER,
+                                     relief="flat", padx=14, pady=7,
+                                     font=("Segoe UI", 10),
+                                     cursor="hand2",
+                                     command=self._load_catalog)
+        self._browse_btn.grid(row=0, column=2, padx=(8,0))
+
+        self._latest_btn = tk.Button(search_wrap, text="Latest",
+                                     bg=CARD, fg=ROSE,
+                                     activebackground=BORDER,
+                                     relief="flat", padx=14, pady=7,
+                                     font=("Segoe UI", 10),
+                                     cursor="hand2",
+                                     command=self._load_latest)
+        self._latest_btn.grid(row=0, column=3, padx=(8,0))
+
         # ── Main content ──────────────────────────────────────────────────────
         content = tk.Frame(self, bg=BG)
         content.grid(row=1, column=0, sticky="nsew", padx=12, pady=8)
@@ -1380,7 +1462,10 @@ class AnimePaheApp(tk.Tk):
 
     def _do_search(self):
         query = self._search_var.get().strip()
-        if not query: return
+        if not query:
+            # Empty search → browse the Latest feed instead.
+            self._load_latest()
+            return
 
         if not self._engine_ready:
             self._set_status("Browser engine still starting — try again in a moment…", WARN)
@@ -1401,6 +1486,51 @@ class AnimePaheApp(tk.Tk):
                 self.after(0, lambda err=e: self._set_status(f"Search error: {err}", ERROR))
             finally:
                 self.after(0, lambda: self._search_btn.config(state="normal", text="Search"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _load_latest(self):
+        """Browse the 'latest releases' feed (default browse view)."""
+        if not self._engine_ready:
+            self._set_status("Browser engine still starting — try again in a moment…", WARN)
+            return
+        self._res_listbox.delete(0, "end")
+        self._checklist.clear()
+        self._search_results = []
+        self._anime_info.config(text="")
+        self._set_status("Loading latest releases…", WARN)
+
+        def run():
+            try:
+                results, _ = fetch_latest(page=1)
+                self.after(0, lambda: self._populate_results(results, "latest", browse="Latest releases"))
+            except Exception as e:
+                self.after(0, lambda err=e: self._set_status(f"Browse error: {err}", ERROR))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _load_catalog(self):
+        """Browse the full A-Z catalog."""
+        if not self._engine_ready:
+            self._set_status("Browser engine still starting — try again in a moment…", WARN)
+            return
+        self._res_listbox.delete(0, "end")
+        self._checklist.clear()
+        self._search_results = []
+        self._anime_info.config(text="")
+        self._browse_btn.config(state="disabled", text="…")
+        self._set_status("Loading full catalog — this can take a few seconds…", WARN)
+
+        def run():
+            try:
+                results = fetch_catalog(
+                    status_cb=lambda m: self.after(0, lambda msg=m: self._set_status(msg, WARN)))
+                self.after(0, lambda: self._populate_results(
+                    results, "catalog", browse=f"Full catalog ({len(results)} titles)"))
+            except Exception as e:
+                self.after(0, lambda err=e: self._set_status(f"Catalog error: {err}", ERROR))
+            finally:
+                self.after(0, lambda: self._browse_btn.config(state="normal", text="Browse all"))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1430,6 +1560,8 @@ class AnimePaheApp(tk.Tk):
             try:
                 get_engine().go_headless()
                 self.after(0, lambda: self._engine_dot.config(text="● ready (minimized)", fg=SUCCESS))
+                # Auto-load the full A-Z catalog so there's something to browse.
+                self.after(300, self._load_catalog)
             except Exception as e:
                 _log(f"GUI: minimize failed {type(e).__name__}")
         threading.Thread(target=hide, daemon=True).start()
@@ -1458,16 +1590,27 @@ class AnimePaheApp(tk.Tk):
         self._set_status(f"Engine failed to start: {err}  "
                          "Make sure Playwright + Chromium are installed.", ERROR)
 
-    def _populate_results(self, results, query):
+    def _populate_results(self, results, query, browse=None):
         self._search_results = results
         if not results:
-            self._set_status(f'No results for "{query}". The site returned an empty list — check spelling or try another title.', WARN)
+            if browse:
+                self._set_status(f"{browse}: nothing returned. Try again in a moment.", WARN)
+            else:
+                self._set_status(f'No results for "{query}". The site returned an empty list — check spelling or try another title.', WARN)
             return
         for r in results:
             year = f" ({r['year']})" if r.get("year") else ""
-            kind = f" [{r['type']}]"  if r.get("type")  else ""
-            self._res_listbox.insert("end", f" {r['title']}{year}{kind}")
-        self._set_status(f"{len(results)} result(s) — click one to load episodes.", SUCCESS)
+            # Only show a type tag for real search results, not browse views.
+            kind = ""
+            if r.get("type") and r["type"] not in ("airing", "catalog"):
+                kind = f" [{r['type']}]"
+            # In the Latest view, show the episode/fansub info after the title.
+            extra = f"  —  {r['status']}" if r.get("type") == "airing" and r.get("status") else ""
+            self._res_listbox.insert("end", f" {r['title']}{year}{kind}{extra}")
+        if browse:
+            self._set_status(f"{browse} — click one to load episodes.", SUCCESS)
+        else:
+            self._set_status(f"{len(results)} result(s) — click one to load episodes.", SUCCESS)
 
     def _on_result_select(self, event=None):
         # Guard against clicks on blank space below the last item. Tkinter's
