@@ -1,6 +1,6 @@
 # AnimePahe Downloader
 
-A desktop GUI tool to search, browse, and batch-download anime episodes from AnimePahe. Built with Python and Tkinter, it drives a stealth browser to get past the bot protection, then streams clean MP4 files straight to disk — with optional Jellyfin/Plex-friendly naming.
+A desktop app to search, browse, and batch-download anime episodes from AnimePahe. It has a clean web-style interface (a synthwave card grid with cover art), drives a stealth browser to get past the bot protection, then streams clean MP4 files straight to disk — with optional Jellyfin/Plex-friendly naming.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![License](https://img.shields.io/badge/license-GPLv3-green) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
 
@@ -9,16 +9,20 @@ A desktop GUI tool to search, browse, and batch-download anime episodes from Ani
 
 ## Features
 
-- **Search and browse** — find anime by name and see all available episodes
+- **Browse the full catalog** — the whole AnimePahe library as a fast, scrollable title list
+- **Latest releases** — a card grid of what's newly aired, with episode thumbnails
+- **Search** — find anime by name, shown as a card grid with cover art
 - **Batch download** — select individual episodes, a range, or a whole season at once
 - **Quality and audio selection** — choose 1080p/720p/480p/360p and sub/dub when available
 - **Background operation** — the browser minimizes and downloads run quietly while you do other things
 - **Jellyfin/Plex naming** — optional `Series/Series - S01E01` folder structure that media servers recognize automatically
-- **Resilient** — automatically retries transient failures and resumes stalled downloads from where they left off
+- **Resilient** — backs off and retries on rate limits, throttling, and transient failures, and resumes stalled downloads
 
 ## How it works
 
 AnimePahe and its file host (Kwik) sit behind Cloudflare, which blocks ordinary scripts and automation tools. This downloader uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a stealth-patched fork of Playwright) to drive a real Chromium browser that clears the Cloudflare check. It keeps one persistent browser session alive with a saved profile, so you typically only solve the "Verify you are human" check once per run.
+
+The interface itself is a local HTML/CSS/JS front-end rendered in a native window via [pywebview](https://pywebview.flowrl.com/) — the Python backend exposes search/browse/download functions to the page through pywebview's JS bridge.
 
 The download flow for each episode is:
 
@@ -37,19 +41,19 @@ The download flow for each episode is:
 ### Arch Linux / CachyOS
 
 ```bash
-# System packages (Tkinter + BeautifulSoup)
-sudo pacman -S python-beautifulsoup4 tk
+# System packages: BeautifulSoup + the GTK WebKit engine pywebview needs
+sudo pacman -S python-beautifulsoup4 webkit2gtk-4.1
 
-# Patchright (stealth Playwright) + its Chromium
-python -m pip install patchright --break-system-packages
+# Python packages
+python -m pip install patchright pywebview --break-system-packages
 python -m patchright install chromium
 ```
 
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install python3-tk python3-bs4
-python3 -m pip install patchright
+sudo apt install python3-bs4 python3-gi gir1.2-webkit2-4.1
+python3 -m pip install patchright pywebview
 python3 -m patchright install chromium
 ```
 
@@ -60,7 +64,7 @@ pip install -r requirements.txt
 python -m patchright install chromium
 ```
 
-(Tkinter ships with the standard Python installer on Windows and macOS.)
+(pywebview uses the built-in system webview on Windows/macOS, so no extra GTK package is needed there.)
 
 ## Usage
 
@@ -69,10 +73,11 @@ python animepahe_downloader.py
 ```
 
 1. When the browser window appears, solve the **"Verify you are human"** check if shown. The window then minimizes itself.
-2. **Search** for an anime by name and click a result to load its episodes.
-3. **Tick** the episodes you want — or use the range box, or the **All** button.
-4. Set your **quality**, **audio**, **season number**, and download folder.
-5. Click **Download**. Episodes download in the background to your chosen folder.
+2. The **full catalog** loads automatically. Use **Browse all**, **Latest**, or **Search** to find a title.
+3. **Click** a title to load its episodes.
+4. **Tick** the episodes you want — or use the range box, or the **All** button.
+5. Set your **quality**, **audio**, **season number**, and a download **folder**.
+6. Click **Download**. Episodes download in the background to your chosen folder.
 
 ### Jellyfin / Plex naming
 
@@ -93,9 +98,11 @@ Point your media server's library at the parent folder and it will recognize the
 
 ## Troubleshooting
 
+**Blank window on Linux.** WebKitGTK can render a blank window due to a GPU-compositing bug. The app already sets `WEBKIT_DISABLE_DMABUF_RENDERER` and `WEBKIT_DISABLE_COMPOSITING_MODE` to work around it. If it still happens, confirm `webkit2gtk-4.1` is installed.
+
 **The browser keeps showing the Cloudflare check.** Make sure Patchright is installed into the *same* Python that runs the app, and that you ran `python -m patchright install chromium`. If a plain Playwright is used by mistake, Cloudflare will loop forever.
 
-**A download stalls or an episode is skipped.** Transient network and CDN hiccups are normal; the tool retries resolves and resumes stalled downloads automatically. A single failure that recovers is nothing to worry about. Repeated failures across many episodes suggest a connection problem or a temporary block.
+**A download stalls or an episode is skipped.** Transient network and CDN hiccups are normal; the tool backs off and retries automatically. A single failure that recovers is nothing to worry about. Repeated failures across many episodes suggest a connection problem or a temporary block — try splitting very long batches into smaller chunks.
 
 **"Sorry, you have been blocked" from Kwik.** This is a server-side IP block, not a bug. Wait a while or try a different connection/VPN.
 

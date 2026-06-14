@@ -2,8 +2,11 @@
 #
 # After installing these, run:  python -m patchright install chromium
 #
-# Note: Tkinter is part of the Python standard library but on Linux it often
-# needs a system package (e.g. `sudo pacman -S tk` or `sudo apt install python3-tk`).
+# IMPORTANT (Linux): pywebview needs a system GTK WebKit package.
+#   Arch / CachyOS:  sudo pacman -S webkit2gtk-4.1
+#   Debian / Ubuntu: sudo apt install python3-gi gir1.2-webkit2-4.1
+# On Windows/macOS pywebview uses the built-in system webview (no extra package).
 
 patchright>=1.40
 beautifulsoup4>=4.12
+pywebview>=5.0

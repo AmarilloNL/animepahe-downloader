@@ -31,11 +31,17 @@ How it works:
   checkbox, click it; the app continues automatically once you're through.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import threading
+import os
+# WebKitGTK on Linux (esp. Arch/CachyOS) often renders a blank window due to a
+# DMABUF/GPU-compositing bug. Disabling those renderers forces software paint,
+# which fixes the blank-window symptom. Must be set BEFORE importing webview.
+os.environ.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+
+import webview
+import threading, queue
 from bs4 import BeautifulSoup
-import re, os, time, json
+import re, time, json
 from pathlib import Path
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -52,19 +58,23 @@ HEADERS  = {
 }
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-BG       = "#0b0c10"
-SURFACE  = "#13141a"
-CARD     = "#1c1d26"
-BORDER   = "#2a2b38"
-ROSE     = "#f472b6"
-ROSE_DIM = "#9d174d"
-TEAL     = "#2dd4bf"
-TEXT     = "#f1f5f9"
-SUBTEXT  = "#94a3b8"
-MUTED    = "#475569"
-SUCCESS  = "#34d399"
-ERROR    = "#fb7185"
-WARN     = "#fbbf24"
+# ── Synthwave / neon palette ──────────────────────────────────────────────────
+# Variable names kept stable; values remapped to a purple+magenta neon theme.
+BG       = "#0a0a14"   # near-black with a blue-violet tint
+SURFACE  = "#11111f"   # panels / bars
+CARD     = "#1a1a2e"   # inputs, list rows, buttons
+BORDER   = "#2d2b50"   # violet-tinted separators
+ROSE     = "#e94aff"   # primary accent — neon magenta
+ROSE_DIM = "#6d28d9"   # deep purple (logo bg, button base, progress)
+TEAL     = "#22d3ee"   # secondary accent — electric cyan
+ACCENT2  = "#a855f7"   # mid purple (hover / highlights)
+TEXT     = "#f5f3ff"   # near-white with a faint violet warmth
+SUBTEXT  = "#9d9bc4"   # muted lavender-grey
+MUTED    = "#56547e"   # dim violet-grey
+SUCCESS  = "#34d399"   # neon green
+ERROR    = "#fb7185"   # neon red/pink
+WARN     = "#fcd34d"   # amber
+SELECT   = "#241a3d"   # selected list-row background (purple glow)
 FONT_UI  = ("Segoe UI", 10)
 FONT_MONO= ("JetBrains Mono", 9) if os.path.exists("/usr/share/fonts/JetBrains") \
            else ("Consolas", 9)
@@ -479,6 +489,35 @@ class BrowserEngine:
                 raise
         raise Exception("api_fetch: could not get past the challenge after retries.")
 
+    def _fetch_image(self, url: str) -> bytes | None:
+        """
+        Fetch a poster/snapshot through the browser's request API. The image host
+        (i.animepahe.pw) sits behind the same Cloudflare protection as the rest of
+        the site, so a bare urllib request gets a 403. The engine's persistent
+        context already holds the clearance cookies; context.request.get() reuses
+        them and isn't subject to the page-level CORP restriction (that only
+        applies to rendering in a document, not to the request API).
+        Returns raw image bytes, or None.
+        """
+        if not url:
+            return None
+        try:
+            page = self._main_page()
+            # Make sure we're on a cleared animepahe origin so cookies are present.
+            if not (page.url or "").startswith(BASE_URL):
+                self._goto(page, BASE_URL)
+            resp = page.context.request.get(url, headers={
+                "Referer": BASE_URL + "/",
+                "Accept": "image/webp,image/*,*/*",
+            }, timeout=15000)
+            if not resp.ok:
+                _log(f"IMG: fetch HTTP {resp.status} {url[:60]}")
+                return None
+            return resp.body()
+        except Exception as e:
+            _log(f"IMG: fetch failed {type(e).__name__} {url[:60]}")
+            return None
+
     def _handle_block(self):
         """Cloudflare is blocking us. Restore the window, signal the GUI, wait
         for the user to clear it, then minimize again."""
@@ -693,6 +732,7 @@ class BrowserEngine:
     def solve(self, url):                 return self._call(self._solve, url)
     def get(self, url):                   return self._call(self._get, url)
     def api_fetch(self, url):             return self._call(self._api_fetch, url)
+    def fetch_image(self, url):           return self._call(self._fetch_image, url)
     def resolve_download(self, url):      return self._call(self._resolve_download, url)
     def download(self, url, dest, hdrs, progress_cb=None, stop_event=None):
         return self._call(self._download, url, dest, hdrs, progress_cb, stop_event)
@@ -843,6 +883,7 @@ def fetch_latest(page: int = 1) -> tuple[list[dict], bool]:
             "status":   f"Ep {i.get('episode', '?')}" + (f" · {i['fansub']}" if i.get("fansub") else ""),
             "episodes": "?",
             "type":     "airing",
+            "poster":   i.get("snapshot", ""),
         })
     last_page = data.get("last_page", 1) if isinstance(data, dict) else 1
     has_more = page < last_page
@@ -875,7 +916,7 @@ def fetch_catalog(status_cb=None) -> list[dict]:
             continue
         results.append({
             "id": sid, "title": title,
-            "year": "", "status": "", "episodes": "?", "type": "catalog",
+            "year": "", "status": "", "episodes": "?", "type": "catalog", "poster": "",
         })
     # Present them alphabetically for easy browsing.
     results.sort(key=lambda r: r["title"].lower())
@@ -898,6 +939,7 @@ def search_anime(query: str, status_cb=None) -> list[dict]:
                 "status":   i.get("status", ""),
                 "episodes": i.get("episodes", "?"),
                 "type":     i.get("type", ""),
+                "poster":   i.get("poster", ""),
             } for i in items]
         # Valid JSON but no matches — that's a genuine empty result
         return []
@@ -916,7 +958,7 @@ def search_anime(query: str, status_cb=None) -> list[dict]:
         results.append({
             "id": m.group(1),
             "title": a.get("title") or a.get_text(strip=True),
-            "year": "", "status": "", "episodes": "?", "type": "",
+            "year": "", "status": "", "episodes": "?", "type": "", "poster": "",
         })
     return results
 
@@ -1018,903 +1060,930 @@ def resolve_download(pahe_or_kwik_url: str) -> tuple[str, dict] | None:
     return get_engine().resolve_download(pahe_or_kwik_url)
 
 
-# ── Custom checkbox list widget ───────────────────────────────────────────────
 
-class CheckList(tk.Frame):
-    """Scrollable list of checkboxes with episode data."""
+# ── Frontend (HTML/CSS/JS served into the pywebview window) ──────────────────
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PAHE DL</title>
+<style>
+  :root{
+    --bg:#0a0a14; --bg2:#0d0d1c; --surface:#12122150; --card:#16162a;
+    --card2:#1c1c34; --border:#2d2b50; --border2:#3a3866;
+    --magenta:#e94aff; --magenta-dim:#a21caf; --purple:#a855f7;
+    --deep:#6d28d9; --cyan:#22d3ee; --text:#f5f3ff; --sub:#b6b3da;
+    --muted:#6e6c9c; --success:#34d399; --error:#fb7185; --warn:#fcd34d;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{height:100%}
+  body{
+    font-family:"Inter","Segoe UI",system-ui,sans-serif;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, #2a0b4e55, transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, #0a3b4a55, transparent 60%),
+      var(--bg);
+    color:var(--text); overflow:hidden; user-select:none;
+  }
+  /* faint synthwave grid floor */
+  body::before{
+    content:""; position:fixed; inset:0; pointer-events:none; opacity:.05;
+    background-image:linear-gradient(var(--magenta) 1px,transparent 1px),
+      linear-gradient(90deg,var(--magenta) 1px,transparent 1px);
+    background-size:42px 42px;
+    mask-image:linear-gradient(transparent 55%, #000 130%);
+  }
+  .app{display:flex; flex-direction:column; height:100vh}
 
-    ROW_H   = 32
-    CB_SIZE = 14
+  /* ── top bar ─────────────────────────────────────────── */
+  .topbar{
+    display:flex; align-items:center; gap:16px; padding:14px 18px;
+    background:linear-gradient(180deg,#13132488,#0d0d1c88);
+    backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--border);
+    box-shadow:0 1px 0 #e94aff33, 0 8px 30px #00000060;
+  }
+  .logo{display:flex; align-items:center; gap:9px; font-weight:800; font-size:18px;
+    letter-spacing:.5px; padding:8px 16px; border-radius:12px;
+    background:linear-gradient(135deg,var(--deep),var(--magenta-dim));
+    box-shadow:0 0 18px #e94aff55, inset 0 0 12px #ffffff15;}
+  .logo .dot{color:var(--cyan); text-shadow:0 0 10px var(--cyan)}
+  .logo .dl{color:var(--cyan); text-shadow:0 0 8px #22d3ee99}
 
-    def __init__(self, master, **kw):
-        super().__init__(master, bg=CARD, **kw)
-        self._items: list[dict] = []   # {"ep":…, "title":…, "var": BooleanVar, …}
-        self._row_frames: list[tk.Frame] = []
+  .searchwrap{flex:1; display:flex; gap:8px; align-items:center}
+  .searchbox{flex:1; position:relative; display:flex; align-items:center;
+    background:var(--card); border:1px solid var(--border); border-radius:12px;
+    padding:0 14px; transition:.2s; box-shadow:inset 0 1px 2px #00000040;}
+  .searchbox:focus-within{border-color:var(--magenta);
+    box-shadow:0 0 0 3px #e94aff22, 0 0 22px #e94aff44;}
+  .searchbox svg{width:17px; height:17px; color:var(--muted); flex:none}
+  .searchbox input{flex:1; background:none; border:none; outline:none;
+    color:var(--text); font-size:14px; padding:12px 10px; user-select:text}
+  .searchbox input::placeholder{color:var(--muted)}
 
-        self._canvas = tk.Canvas(self, bg=CARD, highlightthickness=0, bd=0)
-        self._sb     = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=self._sb.set)
-        self._sb.pack(side="right", fill="y")
-        self._canvas.pack(side="left", fill="both", expand=True)
+  .btn{border:none; cursor:pointer; border-radius:11px; font-size:13px;
+    font-weight:600; padding:11px 16px; transition:.18s; white-space:nowrap;
+    font-family:inherit;}
+  .btn-primary{background:linear-gradient(135deg,var(--deep),var(--magenta));
+    color:#fff; box-shadow:0 0 16px #e94aff44;}
+  .btn-primary:hover{filter:brightness(1.12); box-shadow:0 0 22px #e94aff77;
+    transform:translateY(-1px)}
+  .btn-ghost{background:var(--card); color:var(--magenta);
+    border:1px solid var(--border)}
+  .btn-ghost.cyan{color:var(--cyan)}
+  .btn-ghost:hover{border-color:var(--magenta); color:#fff;
+    box-shadow:0 0 14px #e94aff33}
+  .btn-ghost.cyan:hover{border-color:var(--cyan); box-shadow:0 0 14px #22d3ee33}
+  .btn-ghost.active{background:#241a3d; border-color:var(--magenta); color:#fff}
+  .btn-ghost.cyan.active{border-color:var(--cyan)}
 
-        self._inner = tk.Frame(self._canvas, bg=CARD)
-        self._win   = self._canvas.create_window((0,0), window=self._inner, anchor="nw")
-        self._inner.bind("<Configure>", self._on_inner_cfg)
-        self._canvas.bind("<Configure>", self._on_canvas_cfg)
-        self._canvas.bind("<MouseWheel>", self._on_scroll)
-        self._canvas.bind("<Button-4>",   lambda e: self._canvas.yview_scroll(-1,"units"))
-        self._canvas.bind("<Button-5>",   lambda e: self._canvas.yview_scroll( 1,"units"))
+  .engine{display:flex; align-items:center; gap:10px; flex:none}
+  .dot{display:flex; align-items:center; gap:6px; font-size:12px; color:var(--sub)}
+  .dot .led{width:8px; height:8px; border-radius:50%; background:var(--warn);
+    box-shadow:0 0 8px currentColor; animation:pulse 1.6s infinite}
+  .dot.ready .led{background:var(--success); animation:none}
+  .dot.error .led{background:var(--error); animation:none}
+  @keyframes pulse{50%{opacity:.35}}
 
-    def _on_inner_cfg(self, _=None):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+  /* ── main split ──────────────────────────────────────── */
+  .main{flex:1; display:grid; grid-template-columns:1.4fr 1fr; gap:14px;
+    padding:14px 18px; min-height:0}
+  .panel{background:linear-gradient(180deg,#14142688,#10101e88);
+    border:1px solid var(--border); border-radius:16px; display:flex;
+    flex-direction:column; min-height:0; overflow:hidden;
+    box-shadow:0 10px 40px #00000050}
+  .panel-head{display:flex; align-items:center; justify-content:space-between;
+    padding:13px 16px; border-bottom:1px solid var(--border);
+    font-size:11px; font-weight:700; letter-spacing:1.5px}
+  .panel-head .magenta{color:var(--magenta); text-shadow:0 0 10px #e94aff66}
+  .panel-head .cyan{color:var(--cyan); text-shadow:0 0 10px #22d3ee66}
+  .panel-head .meta{color:var(--muted); font-weight:500; letter-spacing:.3px}
 
-    def _on_canvas_cfg(self, e):
-        self._canvas.itemconfig(self._win, width=e.width)
+  /* ── results card grid ──────────────────────────────── */
+  .grid{flex:1; overflow-y:auto; padding:14px; display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(132px,1fr));
+    gap:13px; align-content:start}
+  .card{position:relative; border-radius:13px; overflow:hidden; cursor:pointer;
+    background:var(--card); border:1px solid var(--border);
+    transition:.18s; aspect-ratio:2/3; display:flex; flex-direction:column}
+  .card:hover{border-color:var(--magenta); transform:translateY(-3px);
+    box-shadow:0 8px 26px #00000070, 0 0 18px #e94aff44}
+  .card.sel{border-color:var(--cyan); box-shadow:0 0 0 2px #22d3ee55,0 0 18px #22d3ee44}
+  .card .thumb{flex:1; background-size:cover; background-position:center;
+    background-color:var(--card2); position:relative}
+  .card .thumb.fallback{display:flex; align-items:center; justify-content:center;
+    background:linear-gradient(135deg,#1c1c34,#241a3d)}
+  .card .thumb.fallback span{font-size:30px; opacity:.5;
+    filter:drop-shadow(0 0 8px #e94aff88)}
+  .card .cap{padding:8px 9px; font-size:11.5px; line-height:1.3; font-weight:600;
+    background:linear-gradient(180deg,#0d0d1cd0,#0d0d1c);
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden}
+  .card .badge{position:absolute; top:7px; left:7px; font-size:9.5px;
+    font-weight:700; padding:3px 7px; border-radius:7px;
+    background:#0a0a14cc; color:var(--cyan); border:1px solid #22d3ee55;
+    backdrop-filter:blur(4px)}
 
-    def _on_scroll(self, e):
-        self._canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+  /* ── catalog list view (no artwork — dense title list) ── */
+  .listview{flex:1; overflow-y:auto; padding:8px; display:flex;
+    flex-direction:column; gap:2px}
+  .list-row{display:flex; align-items:center; gap:11px; padding:9px 13px;
+    border-radius:9px; cursor:pointer; transition:.12s; font-size:13.5px;
+    border:1px solid transparent}
+  .list-row:hover{background:var(--card); border-color:var(--border2)}
+  .list-row.sel{background:#241a3d; border-color:var(--cyan);
+    box-shadow:0 0 12px #22d3ee33}
+  .list-row .li-dot{color:var(--deep); font-size:11px; flex:none;
+    transition:.12s}
+  .list-row:hover .li-dot{color:var(--magenta)}
+  .list-row.sel .li-dot{color:var(--cyan)}
+  .list-row .li-title{color:var(--text); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; font-weight:500}
 
-    def clear(self):
-        for f in self._row_frames: f.destroy()
-        self._row_frames.clear()
-        self._items.clear()
+  .empty{margin:auto; text-align:center; color:var(--muted); font-size:13px;
+    padding:40px}
+  .empty .big{font-size:34px; opacity:.4; margin-bottom:10px}
 
-    def add_episode(self, ep_num, title, session, anime_id):
-        var = tk.BooleanVar(value=False)
-        row = tk.Frame(self._inner, bg=CARD, cursor="hand2")
-        row.pack(fill="x", padx=4, pady=1)
-        self._row_frames.append(row)
+  /* ── episodes / download panel ──────────────────────── */
+  .rightpanel{display:flex; flex-direction:column; min-height:0}
+  .ep-meta{padding:8px 16px; font-size:11px; color:var(--sub);
+    border-bottom:1px solid var(--border); min-height:30px}
+  .ep-list{flex:1; overflow-y:auto; padding:8px 6px}
+  .ep-row{display:flex; align-items:center; gap:10px; padding:8px 11px;
+    border-radius:9px; cursor:pointer; transition:.12s; font-size:13px}
+  .ep-row:hover{background:var(--border)}
+  .ep-row.sel{background:#241a3d}
+  .ep-check{width:17px; height:17px; border-radius:5px; flex:none;
+    border:1.5px solid var(--border2); display:flex; align-items:center;
+    justify-content:center; transition:.12s}
+  .ep-row.sel .ep-check{background:var(--magenta); border-color:var(--magenta);
+    box-shadow:0 0 8px #e94aff88}
+  .ep-check svg{width:11px; height:11px; color:#fff; opacity:0}
+  .ep-row.sel .ep-check svg{opacity:1}
+  .ep-num{color:var(--cyan); font-weight:700; min-width:46px; font-size:12px}
+  .ep-title{color:var(--sub); overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap}
 
-        # Custom checkbox canvas
-        cb_cnv = tk.Canvas(row, width=self.CB_SIZE, height=self.CB_SIZE,
-                           bg=CARD, highlightthickness=0, bd=0)
-        cb_cnv.pack(side="left", padx=(8,6), pady=8)
+  /* ── controls ───────────────────────────────────────── */
+  .controls{border-top:1px solid var(--border); padding:12px 14px;
+    display:flex; flex-direction:column; gap:10px;
+    background:linear-gradient(180deg,transparent,#0d0d1c80)}
+  .ctl-row{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  .seg{display:flex; gap:4px; align-items:center}
+  .seg label{font-size:11px; color:var(--muted); font-weight:600}
+  select,.mini-input{background:var(--card); color:var(--text);
+    border:1px solid var(--border); border-radius:8px; padding:6px 9px;
+    font-size:12px; outline:none; font-family:inherit;
+    -webkit-appearance:none; appearance:none; cursor:pointer;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239d9bc4' stroke-width='3'><path d='M6 9l6 6 6-6'/></svg>");
+    background-repeat:no-repeat; background-position:right 8px center; padding-right:26px}
+  select option{background:#16162a; color:var(--text)}
+  select:focus,.mini-input:focus{border-color:var(--magenta)}
+  .mini-input{width:54px; text-align:center; user-select:text}
+  .chk{display:flex; align-items:center; gap:7px; cursor:pointer; font-size:12px;
+    color:var(--sub)}
+  .chk input{accent-color:var(--magenta); width:15px; height:15px}
+  .range-in{width:48px}
+  .quick{font-size:11px; color:var(--cyan); cursor:pointer; padding:5px 9px;
+    border:1px solid var(--border); border-radius:7px}
+  .quick:hover{border-color:var(--cyan)}
 
-        ep_lbl = tk.Label(row, text=f"Episode {ep_num}",
-                          font=("Segoe UI", 9, "bold"),
-                          bg=CARD, fg=ROSE, width=12, anchor="w")
-        ep_lbl.pack(side="left", padx=(0,8))
+  .dlbar{display:flex; gap:8px; align-items:center}
+  .btn-dl{flex:1; background:linear-gradient(135deg,var(--deep),var(--magenta));
+    color:#fff; font-weight:700; padding:13px; border-radius:11px;
+    box-shadow:0 0 18px #e94aff55}
+  .btn-dl:hover{filter:brightness(1.12); box-shadow:0 0 26px #e94aff88}
+  .btn-dl:disabled{opacity:.4; cursor:default; filter:none; box-shadow:none}
+  .btn-stop{background:#2a1322; color:var(--error); border:1px solid #fb718555;
+    padding:13px 16px; border-radius:11px; font-weight:700}
+  .btn-stop:disabled{opacity:.35; cursor:default}
 
-        title_lbl = tk.Label(row, text=title if title else "",
-                             font=FONT_UI, bg=CARD, fg=TEXT, anchor="w")
-        title_lbl.pack(side="left", fill="x", expand=True)
+  .folder{display:flex; gap:8px; align-items:center}
+  .folder .path{flex:1; font-size:11px; color:var(--sub); background:var(--card);
+    border:1px solid var(--border); border-radius:8px; padding:8px 10px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; user-select:text}
 
-        item = {"ep": ep_num, "title": title, "session": session,
-                "anime_id": anime_id, "var": var, "cb": cb_cnv, "row": row}
-        self._items.append(item)
+  /* ── progress + status ──────────────────────────────── */
+  .prog{height:8px; background:var(--card); border-radius:6px; overflow:hidden;
+    border:1px solid var(--border)}
+  .prog .fill{height:100%; width:0%;
+    background:linear-gradient(90deg,var(--deep),var(--magenta),var(--cyan));
+    box-shadow:0 0 12px #e94aff88; transition:width .3s; border-radius:6px}
+  .statusbar{padding:9px 18px; font-size:12px; border-top:1px solid var(--border);
+    background:#0d0d1c; display:flex; align-items:center; gap:9px; min-height:34px}
+  .statusbar .sled{width:7px;height:7px;border-radius:50%;background:var(--sub);flex:none}
+  .statusbar.info .sled{background:var(--cyan)} .statusbar.info{color:var(--text)}
+  .statusbar.warn .sled{background:var(--warn)} .statusbar.warn{color:var(--warn)}
+  .statusbar.success .sled{background:var(--success)} .statusbar.success{color:var(--success)}
+  .statusbar.error .sled{background:var(--error)} .statusbar.error{color:var(--error)}
 
-        def draw_cb(item=item):
-            c = item["cb"]
-            c.delete("all")
-            if item["var"].get():
-                c.create_rectangle(1,1,self.CB_SIZE-1,self.CB_SIZE-1,
-                                   fill=ROSE, outline=ROSE)
-                c.create_line(3,7,6,10,11,4, fill="white", width=2, capstyle="round", joinstyle="round")
-            else:
-                c.create_rectangle(1,1,self.CB_SIZE-1,self.CB_SIZE-1,
-                                   fill="", outline=BORDER, width=1)
+  ::-webkit-scrollbar{width:10px; height:10px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:var(--border2); border-radius:6px;
+    border:2px solid transparent; background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:var(--purple)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- top bar -->
+  <div class="topbar">
+    <div class="logo"><span class="dot">◆</span>PAHE<span class="dl">DL</span></div>
+    <div class="searchwrap">
+      <div class="searchbox">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="q" placeholder="Search anime…  (empty = Latest)" autocomplete="off">
+      </div>
+      <button class="btn btn-primary" onclick="doSearch()">Search</button>
+      <button class="btn btn-ghost active" id="btnCatalog" onclick="loadCatalog()">Browse all</button>
+      <button class="btn btn-ghost cyan" id="btnLatest" onclick="loadLatest()">Latest</button>
+    </div>
+    <div class="engine">
+      <div class="dot" id="engineDot"><span class="led"></span><span id="engineTxt">starting…</span></div>
+      <button class="btn btn-ghost" onclick="showBrowser()">Show Browser</button>
+    </div>
+  </div>
 
-        def toggle(event=None, item=item):
-            item["var"].set(not item["var"].get())
-            draw_cb(item)
-            self._update_row_bg(item)
+  <!-- main -->
+  <div class="main">
+    <!-- results -->
+    <div class="panel">
+      <div class="panel-head">
+        <span class="magenta" id="resTitle">RESULTS</span>
+        <span class="meta" id="resMeta"></span>
+      </div>
+      <div class="grid" id="grid">
+        <div class="empty"><div class="big">◆</div>Waiting for the browser engine…</div>
+      </div>
+    </div>
 
-        draw_cb(item)
+    <!-- episodes + download -->
+    <div class="panel rightpanel">
+      <div class="panel-head">
+        <span class="cyan" id="epHead">EPISODES</span>
+        <span class="meta" id="epSel"></span>
+      </div>
+      <div class="ep-meta" id="epMeta">Pick an anime on the left.</div>
+      <div class="ep-list" id="epList"></div>
 
-        for widget in (row, cb_cnv, ep_lbl, title_lbl):
-            widget.bind("<Button-1>", toggle)
-            widget.bind("<Enter>",
-                lambda e, r=row: r.config(bg="#212232") or
-                    [w.config(bg="#212232") for w in r.winfo_children()])
-            widget.bind("<Leave>",
-                lambda e, r=row: r.config(bg=CARD) or
-                    [w.config(bg=CARD) for w in r.winfo_children()])
+      <div class="controls">
+        <div class="ctl-row">
+          <div class="seg"><label>Range</label>
+            <input class="mini-input range-in" id="rFrom" placeholder="1">
+            <span style="color:var(--muted)">–</span>
+            <input class="mini-input range-in" id="rTo" placeholder="12"></div>
+          <span class="quick" onclick="applyRange()">Apply</span>
+          <span class="quick" onclick="selectAll(true)">All</span>
+          <span class="quick" onclick="selectAll(false)">None</span>
+        </div>
+        <div class="ctl-row">
+          <div class="seg"><label>Quality</label>
+            <select id="quality"><option>1080</option><option>720</option><option>480</option><option>360</option></select></div>
+          <div class="seg"><label>Audio</label>
+            <select id="audio"><option value="jpn">jpn</option><option value="eng">eng</option></select></div>
+          <div class="seg"><label>Season</label>
+            <input class="mini-input" id="season" value="1"></div>
+          <label class="chk"><input type="checkbox" id="jellyfin" checked>Jellyfin naming</label>
+        </div>
+        <div class="folder">
+          <div class="path" id="folderPath">No folder selected</div>
+          <button class="btn btn-ghost" onclick="chooseFolder()">Folder…</button>
+        </div>
+        <div class="prog"><div class="fill" id="progFill"></div></div>
+        <div class="dlbar">
+          <button class="btn btn-dl" id="btnDl" onclick="startDownload()" disabled>Download</button>
+          <button class="btn btn-stop" id="btnStop" onclick="stopDownload()" disabled>Stop</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
-    def _update_row_bg(self, item):
-        bg = "#1a1b2e" if item["var"].get() else CARD
-        item["row"].config(bg=bg)
-        for w in item["row"].winfo_children():
-            try: w.config(bg=bg)
-            except Exception: pass
+  <!-- status -->
+  <div class="statusbar warn" id="status"><span class="sled"></span><span id="statusTxt">Starting…</span></div>
+</div>
 
-    def select_all(self):
-        for item in self._items:
-            item["var"].set(True)
-            item["cb"].delete("all")
-            item["cb"].create_rectangle(1,1,self.CB_SIZE-1,self.CB_SIZE-1, fill=ROSE, outline=ROSE)
-            item["cb"].create_line(3,7,6,10,11,4, fill="white", width=2, capstyle="round", joinstyle="round")
-            self._update_row_bg(item)
+<script>
+  let RESULTS=[], EPISODES=[], SELECTED=new Set(), FOLDER="", CUR_TITLE="";
+  let apiReady=false;
 
-    def select_none(self):
-        for item in self._items:
-            item["var"].set(False)
-            item["cb"].delete("all")
-            item["cb"].create_rectangle(1,1,self.CB_SIZE-1,self.CB_SIZE-1, fill="", outline=BORDER, width=1)
-            self._update_row_bg(item)
+  function api(){ return window.pywebview.api; }
 
-    def select_range(self, lo: float, hi: float):
-        self.select_none()
-        for item in self._items:
-            try:
-                if lo <= float(item["ep"]) <= hi:
-                    item["var"].set(True)
-                    c = item["cb"]
-                    c.delete("all")
-                    c.create_rectangle(1,1,self.CB_SIZE-1,self.CB_SIZE-1, fill=ROSE, outline=ROSE)
-                    c.create_line(3,7,6,10,11,4, fill="white", width=2, capstyle="round", joinstyle="round")
-                    self._update_row_bg(item)
-            except (ValueError, TypeError):
-                pass
+  window.addEventListener('pywebviewready', ()=>{ apiReady=true; });
 
-    def get_selected(self) -> list[dict]:
-        return [i for i in self._items if i["var"].get()]
+  // ── rendering ────────────────────────────────────────
+  window.renderResults = (data)=>{
+    RESULTS = data.results || [];
+    document.getElementById('resMeta').textContent =
+      RESULTS.length ? RESULTS.length+" titles" : "";
+    const v = data.view;
+    document.getElementById('btnCatalog').classList.toggle('active', v==='catalog');
+    document.getElementById('btnLatest').classList.toggle('active', v==='latest');
+    const g = document.getElementById('grid');
+    if(!RESULTS.length){
+      g.className='grid';
+      g.innerHTML = '<div class="empty"><div class="big">∅</div>Nothing to show.</div>';
+      return;
+    }
+    if(v==='catalog'){
+      // Catalog has no artwork — render a clean, dense title list instead of
+      // image cards. With thousands of entries, putting every row in the DOM at
+      // once makes scrolling sluggish, so we render in chunks and append more as
+      // the user scrolls near the bottom (infinite scroll).
+      g.className='listview';
+      g.innerHTML='';
+      _catalogShown = 0;
+      renderCatalogChunk(g);
+      g.onscroll = ()=>{
+        if(g.scrollTop + g.clientHeight >= g.scrollHeight - 400){
+          renderCatalogChunk(g);
+        }
+      };
+      return;
+    }
+    g.onscroll = null;
+    // Search / Latest → poster card grid
+    g.className='grid';
+    g.innerHTML = '';
+    RESULTS.forEach((r,i)=>{
+      const card = document.createElement('div');
+      card.className='card'; card.onclick=()=>pickAnime(i);
+      const badge = r.type==='airing' && r.status ? `<div class="badge">${escapeHtml(r.status)}</div>` : '';
+      // Start with a fallback tile; fetch the real image via Python (the site's
+      // image host blocks direct cross-origin loads), then swap it in.
+      card.innerHTML =
+        `<div class="thumb fallback" data-i="${i}"><span>◆</span>${badge}</div>`+
+        `<div class="cap">${escapeHtml(r.title)}</div>`;
+      g.appendChild(card);
+    });
+    lazyLoadPosters();
+  };
 
-    def count_selected(self) -> int:
-        return sum(1 for i in self._items if i["var"].get())
+  let _posterQueue=[];
+  let _catalogShown=0;
+  const CATALOG_CHUNK=300;
+  function renderCatalogChunk(g){
+    const end = Math.min(_catalogShown + CATALOG_CHUNK, RESULTS.length);
+    const frag = document.createDocumentFragment();
+    for(let i=_catalogShown; i<end; i++){
+      const r=RESULTS[i];
+      const row=document.createElement('div');
+      row.className='list-row'; row.dataset.i=i; row.onclick=()=>pickAnime(i);
+      row.innerHTML=`<span class="li-dot">◆</span><span class="li-title">${escapeHtml(r.title)}</span>`;
+      frag.appendChild(row);
+    }
+    g.appendChild(frag);
+    _catalogShown = end;
+  }
+  function lazyLoadPosters(){
+    // Build a queue of cards that have a poster URL, load a few at a time so we
+    // don't hammer the engine thread.
+    _posterQueue = RESULTS.map((r,i)=>({i, url:r.poster}))
+                          .filter(x=>x.url && x.url.length>4);
+    pumpPosters();
+  }
+  async function pumpPosters(){
+    if(!apiReady || !_posterQueue.length) return;
+    const batch = _posterQueue.splice(0, 4);
+    await Promise.all(batch.map(async ({i,url})=>{
+      try{
+        const data = await api().get_image(url);
+        if(data){
+          const thumb = document.querySelector(`.thumb[data-i='${i}']`);
+          if(thumb){
+            thumb.classList.remove('fallback');
+            thumb.style.backgroundImage = `url('${data}')`;
+            const span = thumb.querySelector('span'); if(span) span.remove();
+          }
+        }
+      }catch(e){}
+    }));
+    if(_posterQueue.length) setTimeout(pumpPosters, 60);
+  }
+
+  window.renderEpisodes = (data)=>{
+    EPISODES = data.episodes || [];
+    CUR_TITLE = data.title || "";
+    SELECTED.clear();
+    document.getElementById('epHead').textContent = 'EPISODES';
+    document.getElementById('epMeta').textContent =
+      CUR_TITLE + " · " + EPISODES.length + " episodes";
+    const l = document.getElementById('epList');
+    l.innerHTML='';
+    EPISODES.forEach((ep,i)=>{
+      const row=document.createElement('div');
+      row.className='ep-row'; row.dataset.i=i; row.onclick=()=>toggleEp(i);
+      row.innerHTML =
+        `<div class="ep-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg></div>`+
+        `<div class="ep-num">EP ${ep.episode}</div>`+
+        `<div class="ep-title">${escapeHtml(ep.title||'—')}</div>`;
+      l.appendChild(row);
+    });
+    updateSel(); updateDlState();
+  };
+
+  // ── actions ──────────────────────────────────────────
+  function doSearch(){ if(!apiReady)return; api().search(document.getElementById('q').value); }
+  function loadLatest(){ if(!apiReady)return; api().load_latest(); }
+  function loadCatalog(){ if(!apiReady)return; api().load_catalog(); }
+  function showBrowser(){ if(!apiReady)return; api().show_browser(); }
+
+  document.getElementById('q').addEventListener('keydown',e=>{ if(e.key==='Enter')doSearch(); });
+
+  function pickAnime(i){
+    const r=RESULTS[i]; if(!r)return;
+    document.querySelectorAll('.card,.list-row').forEach((c,j)=>c.classList.toggle('sel',j===i));
+    document.getElementById('epMeta').textContent='Loading episodes…';
+    api().get_episodes(r.id, r.title);
+  }
+
+  function toggleEp(i){
+    if(SELECTED.has(i))SELECTED.delete(i); else SELECTED.add(i);
+    document.querySelector(`.ep-row[data-i='${i}']`).classList.toggle('sel',SELECTED.has(i));
+    updateSel(); updateDlState();
+  }
+  function selectAll(on){
+    SELECTED.clear();
+    if(on)EPISODES.forEach((_,i)=>SELECTED.add(i));
+    document.querySelectorAll('.ep-row').forEach(r=>r.classList.toggle('sel',on));
+    updateSel(); updateDlState();
+  }
+  function applyRange(){
+    const lo=parseFloat(document.getElementById('rFrom').value);
+    const hi=parseFloat(document.getElementById('rTo').value);
+    if(isNaN(lo)||isNaN(hi))return;
+    SELECTED.clear();
+    EPISODES.forEach((ep,i)=>{ const n=parseFloat(ep.episode);
+      if(!isNaN(n)&&n>=lo&&n<=hi)SELECTED.add(i); });
+    document.querySelectorAll('.ep-row').forEach(r=>{
+      const i=+r.dataset.i; r.classList.toggle('sel',SELECTED.has(i)); });
+    updateSel(); updateDlState();
+  }
+  function updateSel(){
+    document.getElementById('epSel').textContent = SELECTED.size? SELECTED.size+" selected":"";
+  }
+  function updateDlState(){
+    document.getElementById('btnDl').disabled = SELECTED.size===0 || !FOLDER;
+  }
+
+  async function chooseFolder(){
+    if(!apiReady)return;
+    const f = await api().choose_folder();
+    if(f){ FOLDER=f; document.getElementById('folderPath').textContent=f; updateDlState(); }
+  }
+
+  function startDownload(){
+    if(!apiReady || SELECTED.size===0 || !FOLDER) return;
+    const eps=[...SELECTED].sort((a,b)=>a-b).map(i=>({
+      ep:EPISODES[i].episode, title:CUR_TITLE,
+      session:EPISODES[i].session, anime_id:EPISODES[i].anime_id }));
+    api().start_download({
+      episodes:eps, dest:FOLDER,
+      quality:document.getElementById('quality').value,
+      audio:document.getElementById('audio').value,
+      season:parseInt(document.getElementById('season').value)||1,
+      jellyfin:document.getElementById('jellyfin').checked
+    });
+    document.getElementById('btnDl').disabled=true;
+    document.getElementById('btnStop').disabled=false;
+  }
+  function stopDownload(){ if(apiReady)api().stop_download();
+    document.getElementById('btnStop').disabled=true; }
+
+  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g,c=>(
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  // ── polling for status / progress / engine ───────────
+  async function poll(){
+    if(apiReady){
+      try{
+        const s=await api().poll_status();
+        const bar=document.getElementById('status');
+        bar.className='statusbar '+(s.kind||'info');
+        document.getElementById('statusTxt').textContent=s.msg;
+
+        const p=await api().poll_progress();
+        document.getElementById('progFill').style.width=(p.value||0)+'%';
+
+        const e=await api().engine_state();
+        const dot=document.getElementById('engineDot');
+        dot.className='dot'+(e.ready?' ready':'')+(e.dot==='error'?' error':'');
+        document.getElementById('engineTxt').textContent=
+          e.dot==='minimized'?'ready':e.dot;
+        // re-enable download button when a run finishes
+        if(p.value>=100 || (s.msg&&s.msg.startsWith('Done'))){
+          document.getElementById('btnStop').disabled=true;
+          updateDlState();
+        }
+      }catch(err){}
+    }
+    setTimeout(poll, 600);
+  }
+  poll();
+</script>
+</body>
+</html>
+"""
 
 
-# ── Main App ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Web UI  —  pywebview frontend + Python API bridge
+#  (The backend above — engine, search/browse/episode fetch, resolve, download —
+#   is unchanged. This layer replaces the old Tkinter GUI with an HTML/CSS/JS
+#   window driven through pywebview's JS↔Python bridge.)
+# ══════════════════════════════════════════════════════════════════════════════
 
-class AnimePaheApp(tk.Tk):
+
+class Api:
+    """
+    Exposed to JavaScript as window.pywebview.api.<method>.
+    Only basic types (str/int/dict/list/bool) cross the bridge. Long-running
+    work (engine start, searches, downloads) runs in background threads and the
+    UI polls poll_status()/poll_progress() for live updates.
+    """
+
     def __init__(self):
-        super().__init__()
-        self.title("AnimePahe Downloader")
-        self.geometry("1120x720")
-        self.minsize(900, 560)
-        self.configure(bg=BG)
-
-        self._search_results: list[dict] = []
-        self._episodes:       list[dict] = []
+        self._window = None
+        self._engine_ready = False
         self._stop_event = threading.Event()
-        self._engine_ready = False
-        # Download preferences (changeable in the UI)
-        self._quality_var = tk.StringVar(value="1080")
-        self._audio_var   = tk.StringVar(value="jpn")
-        self._season_var  = tk.StringVar(value="1")
-        self._jellyfin_var = tk.BooleanVar(value=True)
+        self._downloading = False
+        # Thread-safe channels the JS side polls.
+        self._status = {"msg": "Starting…", "kind": "warn"}
+        self._progress = {"value": 0.0, "label": ""}
+        self._results = []            # last results shown (for episode lookups)
+        self._current_title = ""
+        self._engine_dot = "starting"
 
-        self._setup_styles()
-        self._build_ui()
-        # Warm up the browser engine in the background on startup
-        self.after(300, self._startup_engine)
+    # ── wiring ────────────────────────────────────────────────────────────────
+    def _set_status(self, msg, kind="info"):
+        self._status = {"msg": msg, "kind": kind}
+        _log(f"UI[{kind}]: {msg}")
 
-    def _setup_styles(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure("TScrollbar", troughcolor=SURFACE, background=BORDER,
-                    bordercolor=SURFACE, arrowcolor=SUBTEXT)
-        s.configure("Rose.Horizontal.TProgressbar",
-                    troughcolor=SURFACE, background=ROSE,
-                    bordercolor=SURFACE, lightcolor=ROSE, darkcolor=ROSE_DIM)
+    def _set_progress(self, value, label=""):
+        self._progress = {"value": round(value, 1), "label": label}
 
-    def _build_ui(self):
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+    def poll_status(self):
+        return self._status
 
-        # ── Top bar ───────────────────────────────────────────────────────────
-        top = tk.Frame(self, bg=SURFACE, pady=0)
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(1, weight=1)
+    def poll_progress(self):
+        return self._progress
 
-        # Logo / title
-        logo = tk.Frame(top, bg=ROSE_DIM, padx=16, pady=14)
-        logo.grid(row=0, column=0)
-        tk.Label(logo, text="🌸 pahe", font=("Segoe UI", 13, "bold"),
-                 bg=ROSE_DIM, fg="white").pack()
+    def engine_state(self):
+        return {"ready": self._engine_ready, "dot": self._engine_dot}
 
-        # Engine status indicator in top bar
-        btn_wrap = tk.Frame(top, bg=SURFACE)
-        btn_wrap.grid(row=0, column=2, padx=(0,8))
-
-        self._engine_dot = tk.Label(btn_wrap, text="● starting…",
-                                    bg=SURFACE, fg=WARN,
-                                    font=("Segoe UI", 9), padx=10, pady=14)
-        self._engine_dot.pack(side="left")
-
-        self._show_browser_btn = tk.Button(btn_wrap, text="🔍 Show Browser",
-                                           bg=SURFACE, fg=SUBTEXT,
-                                           activebackground=CARD, activeforeground=ROSE,
-                                           relief="flat", padx=10, pady=14,
-                                           font=("Segoe UI", 9), cursor="hand2",
-                                           command=lambda: self._show_browser())
-        self._show_browser_btn.pack(side="left")
-
-        # Search area
-        search_wrap = tk.Frame(top, bg=SURFACE, padx=16, pady=10)
-        search_wrap.grid(row=0, column=1, sticky="ew")
-        search_wrap.columnconfigure(0, weight=1)
-
-        entry_frame = tk.Frame(search_wrap, bg=CARD, padx=10, pady=6)
-        entry_frame.grid(row=0, column=0, sticky="ew")
-        entry_frame.columnconfigure(0, weight=1)
-
-        self._search_var = tk.StringVar()
-        tk.Entry(entry_frame, textvariable=self._search_var,
-                 bg=CARD, fg=TEXT, insertbackground=ROSE,
-                 relief="flat", font=("Segoe UI", 11), bd=0).grid(
-                     row=0, column=0, sticky="ew")
-        self._search_var.trace_add("write", lambda *_: None)
-
-        self._search_entry = entry_frame.winfo_children()[0]
-        self._search_entry.bind("<Return>", lambda _: self._do_search())
-
-        self._search_btn = tk.Button(search_wrap, text="Search",
-                                     bg=ROSE_DIM, fg="white",
-                                     activebackground=ROSE,
-                                     relief="flat", padx=16, pady=7,
-                                     font=("Segoe UI", 10, "bold"),
-                                     cursor="hand2",
-                                     command=self._do_search)
-        self._search_btn.grid(row=0, column=1, padx=(8,0))
-
-        self._browse_btn = tk.Button(search_wrap, text="Browse all",
-                                     bg=CARD, fg=ROSE,
-                                     activebackground=BORDER,
-                                     relief="flat", padx=14, pady=7,
-                                     font=("Segoe UI", 10),
-                                     cursor="hand2",
-                                     command=self._load_catalog)
-        self._browse_btn.grid(row=0, column=2, padx=(8,0))
-
-        self._latest_btn = tk.Button(search_wrap, text="Latest",
-                                     bg=CARD, fg=ROSE,
-                                     activebackground=BORDER,
-                                     relief="flat", padx=14, pady=7,
-                                     font=("Segoe UI", 10),
-                                     cursor="hand2",
-                                     command=self._load_latest)
-        self._latest_btn.grid(row=0, column=3, padx=(8,0))
-
-        # ── Main content ──────────────────────────────────────────────────────
-        content = tk.Frame(self, bg=BG)
-        content.grid(row=1, column=0, sticky="nsew", padx=12, pady=8)
-        content.columnconfigure(0, weight=2, minsize=320)
-        content.columnconfigure(1, weight=3)
-        content.rowconfigure(0, weight=1)
-
-        # ── Left: search results ──────────────────────────────────────────────
-        left = tk.Frame(content, bg=SURFACE, bd=0)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0,6))
-        left.rowconfigure(1, weight=1)
-        left.columnconfigure(0, weight=1)
-
-        tk.Label(left, text="RESULTS", font=("Segoe UI", 8, "bold"),
-                 bg=SURFACE, fg=MUTED, anchor="w", padx=10, pady=8).grid(
-                     row=0, column=0, sticky="ew")
-
-        res_frame = tk.Frame(left, bg=CARD)
-        res_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0,6))
-        res_frame.rowconfigure(0, weight=1)
-        res_frame.columnconfigure(0, weight=1)
-
-        self._res_listbox = tk.Listbox(
-            res_frame, selectmode="single",
-            bg=CARD, fg=TEXT,
-            selectbackground=ROSE_DIM, selectforeground="white",
-            relief="flat", bd=0, font=("Segoe UI", 10),
-            activestyle="none", highlightthickness=0, cursor="hand2")
-        self._res_listbox.grid(row=0, column=0, sticky="nsew")
-        # Use ButtonRelease so the event carries a y-coordinate we can validate
-        # against real rows (avoids selecting blank space below the last item).
-        self._res_listbox.bind("<ButtonRelease-1>", self._on_result_select)
-
-        res_sb = ttk.Scrollbar(res_frame, orient="vertical",
-                               command=self._res_listbox.yview)
-        res_sb.grid(row=0, column=1, sticky="ns")
-        self._res_listbox.configure(yscrollcommand=res_sb.set)
-
-        # Horizontal scrollbar so long titles are reachable without maximizing.
-        res_hsb = ttk.Scrollbar(res_frame, orient="horizontal",
-                                command=self._res_listbox.xview)
-        res_hsb.grid(row=1, column=0, sticky="ew")
-        self._res_listbox.configure(xscrollcommand=res_hsb.set)
-
-        self._anime_info = tk.Label(left, text="", font=("Segoe UI", 8),
-                                    bg=SURFACE, fg=SUBTEXT, wraplength=300,
-                                    justify="left", padx=10, pady=4)
-        self._anime_info.grid(row=2, column=0, sticky="ew")
-
-        # ── Right: episode list ───────────────────────────────────────────────
-        right = tk.Frame(content, bg=SURFACE)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(1, weight=1)
-        right.columnconfigure(0, weight=1)
-
-        # Episode header row
-        ep_hdr = tk.Frame(right, bg=SURFACE)
-        ep_hdr.grid(row=0, column=0, sticky="ew", padx=10, pady=(8,4))
-        ep_hdr.columnconfigure(0, weight=1)
-
-        self._ep_label = tk.Label(ep_hdr, text="EPISODES",
-                                  font=("Segoe UI", 8, "bold"),
-                                  bg=SURFACE, fg=MUTED, anchor="w")
-        self._ep_label.grid(row=0, column=0, sticky="w")
-
-        btn_bar = tk.Frame(ep_hdr, bg=SURFACE)
-        btn_bar.grid(row=0, column=1, sticky="e")
-
-        for label, cmd in [("All", lambda: self._checklist.select_all()),
-                           ("None", lambda: self._checklist.select_none())]:
-            tk.Button(btn_bar, text=label, bg=CARD, fg=SUBTEXT,
-                      activebackground=BORDER, activeforeground=TEXT,
-                      relief="flat", padx=10, pady=3,
-                      font=("Segoe UI", 8), cursor="hand2",
-                      command=cmd).pack(side="left", padx=2)
-
-        # Range selector
-        rng_bar = tk.Frame(ep_hdr, bg=SURFACE)
-        rng_bar.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4,0))
-
-        tk.Label(rng_bar, text="Range:", bg=SURFACE, fg=SUBTEXT,
-                 font=("Segoe UI", 8)).pack(side="left")
-
-        self._range_from = tk.Entry(rng_bar, width=5, bg=CARD, fg=TEXT,
-                                    insertbackground=ROSE, relief="flat",
-                                    font=("Segoe UI", 9), bd=4)
-        self._range_from.pack(side="left", padx=(4,2))
-
-        tk.Label(rng_bar, text="–", bg=SURFACE, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).pack(side="left")
-
-        self._range_to = tk.Entry(rng_bar, width=5, bg=CARD, fg=TEXT,
-                                  insertbackground=ROSE, relief="flat",
-                                  font=("Segoe UI", 9), bd=4)
-        self._range_to.pack(side="left", padx=(2,6))
-
-        tk.Button(rng_bar, text="Apply", bg=ROSE_DIM, fg="white",
-                  relief="flat", padx=8, pady=2, font=("Segoe UI", 8),
-                  cursor="hand2", command=self._apply_range).pack(side="left")
-
-        self._sel_count = tk.Label(rng_bar, text="", bg=SURFACE, fg=ROSE,
-                                   font=("Segoe UI", 8))
-        self._sel_count.pack(side="left", padx=(12,0))
-
-        # CheckList
-        self._checklist = CheckList(right)
-        self._checklist.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0,6))
-
-        # ── Bottom bar ────────────────────────────────────────────────────────
-        bot = tk.Frame(self, bg=SURFACE, padx=12, pady=10)
-        bot.grid(row=2, column=0, sticky="ew")
-        bot.columnconfigure(1, weight=1)
-
-        tk.Label(bot, text="Save to", bg=SURFACE, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", padx=(0,8))
-
-        self._dir_var = tk.StringVar(value=str(Path.home() / "Downloads"))
-        tk.Entry(bot, textvariable=self._dir_var,
-                 bg=CARD, fg=TEXT, insertbackground=ROSE,
-                 relief="flat", font=("Segoe UI", 9), bd=6).grid(
-                     row=0, column=1, sticky="ew")
-
-        tk.Button(bot, text="…", bg=CARD, fg=ROSE,
-                  relief="flat", padx=10, pady=3,
-                  font=("Segoe UI", 9), cursor="hand2",
-                  command=self._browse).grid(row=0, column=2, padx=(6,0))
-
-        # Quality + audio preference row
-        pref = tk.Frame(bot, bg=SURFACE)
-        pref.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8,0))
-        tk.Label(pref, text="Quality", bg=SURFACE, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(0,4))
-        q_menu = tk.OptionMenu(pref, self._quality_var, "1080", "720", "480", "360")
-        q_menu.config(bg=CARD, fg=TEXT, relief="flat", highlightthickness=0,
-                      activebackground=BORDER, font=("Segoe UI", 9), width=6)
-        q_menu["menu"].config(bg=CARD, fg=TEXT)
-        q_menu.pack(side="left", padx=(0,16))
-        tk.Label(pref, text="Audio", bg=SURFACE, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(0,4))
-        a_menu = tk.OptionMenu(pref, self._audio_var, "jpn", "eng")
-        a_menu.config(bg=CARD, fg=TEXT, relief="flat", highlightthickness=0,
-                      activebackground=BORDER, font=("Segoe UI", 9), width=6)
-        a_menu["menu"].config(bg=CARD, fg=TEXT)
-        a_menu.pack(side="left")
-
-        # Season number (for Jellyfin SxxEyy naming)
-        tk.Label(pref, text="Season", bg=SURFACE, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(16,4))
-        season_entry = tk.Entry(pref, textvariable=self._season_var, width=4,
-                                bg=CARD, fg=TEXT, insertbackground=ROSE,
-                                relief="flat", font=("Segoe UI", 9), justify="center")
-        season_entry.pack(side="left")
-
-        # Jellyfin-friendly naming toggle
-        jf = tk.Checkbutton(pref, text="Jellyfin naming (S01E01 + folder)",
-                            variable=self._jellyfin_var,
-                            bg=SURFACE, fg=SUBTEXT, selectcolor=CARD,
-                            activebackground=SURFACE, activeforeground=TEXT,
-                            relief="flat", font=("Segoe UI", 9),
-                            highlightthickness=0, bd=0)
-        jf.pack(side="left", padx=(16,0))
-
-        self._progress = ttk.Progressbar(bot, style="Rose.Horizontal.TProgressbar",
-                                         mode="determinate")
-        self._progress.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8,4))
-
-        self._status_var = tk.StringVar(value="Search for an anime above to get started.")
-        self._status_lbl = tk.Label(bot, textvariable=self._status_var,
-                                    bg=SURFACE, fg=SUBTEXT,
-                                    font=("Segoe UI", 9), anchor="w")
-        self._status_lbl.grid(row=2, column=0, columnspan=2, sticky="ew")
-
-        action_bar = tk.Frame(bot, bg=SURFACE)
-        action_bar.grid(row=1, column=3, rowspan=2, sticky="se")
-
-        self._dl_btn = tk.Button(action_bar, text="⬇  Download",
-                                 bg=ROSE_DIM, fg="white",
-                                 activebackground=ROSE,
-                                 relief="flat", padx=18, pady=8,
-                                 font=("Segoe UI", 10, "bold"),
-                                 cursor="hand2",
-                                 command=self._start_download)
-        self._dl_btn.pack(side="left", padx=(0,6))
-
-        self._stop_btn = tk.Button(action_bar, text="■ Stop",
-                                   bg=CARD, fg=ERROR,
-                                   activebackground=BORDER,
-                                   relief="flat", padx=12, pady=8,
-                                   font=("Segoe UI", 10, "bold"),
-                                   cursor="hand2", state="disabled",
-                                   command=self._stop_download)
-        self._stop_btn.pack(side="left")
-
-    # ── Search ────────────────────────────────────────────────────────────────
-
-    def _do_search(self):
-        query = self._search_var.get().strip()
-        if not query:
-            # Empty search → browse the Latest feed instead.
-            self._load_latest()
-            return
-
-        if not self._engine_ready:
-            self._set_status("Browser engine still starting — try again in a moment…", WARN)
-            return
-
-        self._search_btn.config(state="disabled", text="…")
-        self._res_listbox.delete(0, "end")
-        self._checklist.clear()
-        self._search_results = []
-        self._anime_info.config(text="")
-        self._set_status(f'Searching for "{query}"…', WARN)
-
-        def run():
-            try:
-                results = search_anime(query)
-                self.after(0, lambda: self._populate_results(results, query))
-            except Exception as e:
-                self.after(0, lambda err=e: self._set_status(f"Search error: {err}", ERROR))
-            finally:
-                self.after(0, lambda: self._search_btn.config(state="normal", text="Search"))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _load_latest(self):
-        """Browse the 'latest releases' feed (default browse view)."""
-        if not self._engine_ready:
-            self._set_status("Browser engine still starting — try again in a moment…", WARN)
-            return
-        self._res_listbox.delete(0, "end")
-        self._checklist.clear()
-        self._search_results = []
-        self._anime_info.config(text="")
-        self._set_status("Loading latest releases…", WARN)
-
-        def run():
-            try:
-                results, _ = fetch_latest(page=1)
-                self.after(0, lambda: self._populate_results(results, "latest", browse="Latest releases"))
-            except Exception as e:
-                self.after(0, lambda err=e: self._set_status(f"Browse error: {err}", ERROR))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _load_catalog(self):
-        """Browse the full A-Z catalog."""
-        if not self._engine_ready:
-            self._set_status("Browser engine still starting — try again in a moment…", WARN)
-            return
-        self._res_listbox.delete(0, "end")
-        self._checklist.clear()
-        self._search_results = []
-        self._anime_info.config(text="")
-        self._browse_btn.config(state="disabled", text="…")
-        self._set_status("Loading full catalog — this can take a few seconds…", WARN)
-
-        def run():
-            try:
-                results = fetch_catalog(
-                    status_cb=lambda m: self.after(0, lambda msg=m: self._set_status(msg, WARN)))
-                self.after(0, lambda: self._populate_results(
-                    results, "catalog", browse=f"Full catalog ({len(results)} titles)"))
-            except Exception as e:
-                self.after(0, lambda err=e: self._set_status(f"Catalog error: {err}", ERROR))
-            finally:
-                self.after(0, lambda: self._browse_btn.config(state="normal", text="Browse all"))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _startup_engine(self):
-        """Start the persistent browser engine in the background."""
-        self._engine_ready = False
-        self._engine_dot.config(text="● starting…", fg=WARN)
-        self._set_status("Opening browser — if you see 'Verify you are human', click it in the browser window.", WARN)
+    # ── engine lifecycle ────────────────────────────────────────────────────────
+    def start_engine(self):
+        """Kick off the persistent browser engine in the background."""
+        self._engine_dot = "starting"
+        self._set_status("Opening browser — if you see 'Verify you are human', "
+                         "click it in the browser window.", "warn")
 
         def run():
             try:
                 get_engine(headless=False,
-                           status_cb=lambda m: self.after(0, lambda msg=m: self._set_status(msg, WARN)),
-                           on_challenge=lambda: self.after(0, self._on_challenge_needed))
-                self.after(0, self._engine_ok)
+                           status_cb=lambda m: self._set_status(m, "warn"),
+                           on_challenge=lambda: self._on_challenge())
+                self._engine_ready = True
+                self._engine_dot = "ready"
+                self._set_status("Browser ready ✓  Minimizing it — browse away.", "success")
+                try:
+                    get_engine().go_headless()
+                    self._engine_dot = "minimized"
+                except Exception as e:
+                    _log(f"UI: minimize failed {type(e).__name__}")
+                # Auto-load the full catalog once ready.
+                self.load_catalog()
             except Exception as e:
-                self.after(0, lambda err=e: self._engine_fail(err))
+                self._engine_dot = "error"
+                self._set_status(f"Engine failed to start: {e}", "error")
 
         threading.Thread(target=run, daemon=True).start()
+        return True
 
-    def _engine_ok(self):
-        self._engine_ready = True
-        self._engine_dot.config(text="● ready", fg=SUCCESS)
-        self._set_status("Browser ready ✓  Minimizing it — search away. Use 'Show Browser' if a check reappears.", SUCCESS)
-        # Minimize the browser now that the challenge is solved.
-        def hide():
-            try:
-                get_engine().go_headless()
-                self.after(0, lambda: self._engine_dot.config(text="● ready (minimized)", fg=SUCCESS))
-                # Auto-load the full A-Z catalog so there's something to browse.
-                self.after(300, self._load_catalog)
-            except Exception as e:
-                _log(f"GUI: minimize failed {type(e).__name__}")
-        threading.Thread(target=hide, daemon=True).start()
+    def _on_challenge(self):
+        self._engine_dot = "challenge"
+        self._set_status("Cloudflare check reappeared — solve it in the browser "
+                         "window; it hides again after.", "warn")
 
-    def _on_challenge_needed(self):
-        """Engine signalled it needs a visible re-solve."""
-        self._engine_dot.config(text="● solve in browser", fg=WARN)
-        self._set_status("Cloudflare check reappeared — solve it in the browser window; it'll hide again after.", WARN)
-
-    def _show_browser(self):
-        """Manually bring the browser back to solve a challenge."""
+    def show_browser(self):
         if not self._engine_ready:
-            self._set_status("Engine still starting…", WARN)
-            return
-        self._set_status("Bringing the browser forward… solve any check, then it hides again.", WARN)
-        def run():
-            try:
-                get_engine().go_visible()
-            except Exception as e:
-                _log(f"GUI: go_visible failed {type(e).__name__}")
-        threading.Thread(target=run, daemon=True).start()
+            self._set_status("Engine still starting…", "warn")
+            return False
+        self._set_status("Bringing the browser forward… solve any check, then it hides.", "warn")
+        threading.Thread(target=lambda: get_engine().go_visible(), daemon=True).start()
+        return True
 
-    def _engine_fail(self, err):
-        self._engine_ready = False
-        self._engine_dot.config(text="● error", fg=ERROR)
-        self._set_status(f"Engine failed to start: {err}  "
-                         "Make sure Playwright + Chromium are installed.", ERROR)
+    # ── browse / search ──────────────────────────────────────────────────────────
+    def _guard(self):
+        if not self._engine_ready:
+            self._set_status("Browser engine still starting — try again in a moment…", "warn")
+            return False
+        return True
 
-    def _populate_results(self, results, query, browse=None):
-        self._search_results = results
-        if not results:
-            if browse:
-                self._set_status(f"{browse}: nothing returned. Try again in a moment.", WARN)
-            else:
-                self._set_status(f'No results for "{query}". The site returned an empty list — check spelling or try another title.', WARN)
-            return
-        for r in results:
-            year = f" ({r['year']})" if r.get("year") else ""
-            # Only show a type tag for real search results, not browse views.
-            kind = ""
-            if r.get("type") and r["type"] not in ("airing", "catalog"):
-                kind = f" [{r['type']}]"
-            # In the Latest view, show the episode/fansub info after the title.
-            extra = f"  —  {r['status']}" if r.get("type") == "airing" and r.get("status") else ""
-            self._res_listbox.insert("end", f" {r['title']}{year}{kind}{extra}")
-        if browse:
-            self._set_status(f"{browse} — click one to load episodes.", SUCCESS)
-        else:
-            self._set_status(f"{len(results)} result(s) — click one to load episodes.", SUCCESS)
-
-    def _on_result_select(self, event=None):
-        # Guard against clicks on blank space below the last item. Tkinter's
-        # Listbox still fires a selection for empty-area clicks; verify the
-        # click y-coordinate actually falls on a real row.
-        if event is not None and hasattr(event, "y"):
-            idx = self._res_listbox.nearest(event.y)
-            bbox = self._res_listbox.bbox(idx)
-            if not bbox:
-                return
-            y0, height = bbox[1], bbox[3]
-            if event.y > y0 + height:        # clicked below the last row
-                self._res_listbox.selection_clear(0, "end")
-                return
-            # Force the selection to the item actually under the cursor.
-            self._res_listbox.selection_clear(0, "end")
-            self._res_listbox.selection_set(idx)
-
-        sel = self._res_listbox.curselection()
-        if not sel: return
-        anime = self._search_results[sel[0]]
-
-        parts = [p for p in [
-            f"Status: {anime['status']}" if anime.get("status") else "",
-            f"Eps: {anime['episodes']}"  if anime.get("episodes") else "",
-            anime.get("type", ""),
-        ] if p]
-        self._anime_info.config(text="  ·  ".join(parts))
-
-        self._checklist.clear()
-        self._ep_label.config(text="EPISODES — loading…")
-        # Don't stomp on the download status line if a download is in progress.
-        downloading = not self._stop_event.is_set() and self._dl_btn["state"] == "disabled"
-        if not downloading:
-            self._set_status(f"Loading episodes for {anime['title']}…", WARN)
+    def search(self, query):
+        query = (query or "").strip()
+        if not query:
+            return self.load_latest()
+        if not self._guard():
+            return False
+        self._set_status(f'Searching for "{query}"…', "warn")
 
         def run():
             try:
-                def page_cb(p, t):
-                    if not (not self._stop_event.is_set() and self._dl_btn["state"] == "disabled"):
-                        self.after(0, lambda pg=p, tot=t:
-                            self._set_status(f"Fetching page {pg}/{tot}…", WARN))
-                eps = fetch_episodes(anime["id"], progress_cb=page_cb)
-                self.after(0, lambda: self._populate_episodes(eps, anime["title"]))
+                results = search_anime(query)
+                self._results = results
+                self._push_results(results, f'{len(results)} result(s) for "{query}"' if results
+                                   else f'No results for "{query}".')
             except Exception as e:
-                self.after(0, lambda err=e: self._set_status(f"Episode load error: {err}", ERROR))
-
+                self._set_status(f"Search error: {e}", "error")
         threading.Thread(target=run, daemon=True).start()
+        return True
 
-    def _populate_episodes(self, episodes, title):
-        self._episodes = episodes
-        self._current_anime_title = title   # clean title for filenames
-        self._checklist.clear()
-        for ep in episodes:
-            self._checklist.add_episode(
-                ep["episode"],
-                ep["title"],       # show whatever the API gives; blank → "—"
-                ep["session"],
-                ep["anime_id"],
-            )
-        count = len(episodes)
-        self._ep_label.config(text=f"EPISODES — {count} total")
-        downloading = not self._stop_event.is_set() and self._dl_btn["state"] == "disabled"
-        if not downloading:
-            self._set_status(f"Loaded {count} episodes for {title}. Select episodes below.", SUCCESS)
-        self._update_sel_count()
+    def load_latest(self):
+        if not self._guard():
+            return False
+        self._set_status("Loading latest releases…", "warn")
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        def run():
+            try:
+                results, _ = fetch_latest(page=1)
+                self._results = results
+                self._push_results(results, "Latest releases", view="latest")
+            except Exception as e:
+                self._set_status(f"Browse error: {e}", "error")
+        threading.Thread(target=run, daemon=True).start()
+        return True
 
-    def _update_sel_count(self):
-        n = self._checklist.count_selected()
-        self._sel_count.config(text=f"{n} selected" if n else "")
+    def load_catalog(self):
+        if not self._guard():
+            return False
+        self._set_status("Loading full catalog — this can take a few seconds…", "warn")
 
-    def _apply_range(self):
+        def run():
+            try:
+                results = fetch_catalog(status_cb=lambda m: self._set_status(m, "warn"))
+                self._results = results
+                self._push_results(results, f"Full catalog · {len(results)} titles", view="catalog")
+            except Exception as e:
+                self._set_status(f"Catalog error: {e}", "error")
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def _push_results(self, results, status_msg, view="search"):
+        """Send results to the JS side by calling a global render function."""
+        payload = json.dumps({"results": results, "view": view, "status": status_msg})
+        self._set_status(status_msg, "success" if results else "warn")
+        if self._window:
+            # escape for safe embedding in evaluate_js
+            safe = payload.replace("\\", "\\\\").replace("`", "\\`")
+            try:
+                self._window.evaluate_js(f"window.renderResults(JSON.parse(`{safe}`))")
+            except Exception as e:
+                _log(f"UI: push_results evaluate_js failed {e}")
+
+    # ── episodes ──────────────────────────────────────────────────────────────────
+    def get_image(self, url):
+        """
+        Return a poster/snapshot as an inline base64 data: URL.
+
+        The image host is behind Cloudflare, so the bytes are fetched through the
+        engine's authenticated browser context (which holds clearance cookies),
+        cached to a temp file, then returned as a data: URI. We use a data URI
+        (not a file:// path) because WebKitGTK refuses to render a file:// image
+        that lives outside the page's own folder. Posters are small webps, so the
+        data URL crosses the bridge fine.
+        """
+        if not url or not self._engine_ready:
+            return ""
+        import hashlib, tempfile, base64, mimetypes
         try:
-            lo = float(self._range_from.get().strip())
-            hi = float(self._range_to.get().strip())
-        except ValueError:
-            messagebox.showwarning("Invalid range", "Enter valid episode numbers.")
-            return
-        self._checklist.select_range(lo, hi)
-        n = self._checklist.count_selected()
-        self._set_status(f"Selected {n} episode(s) in range {lo}–{hi}.", TEAL)
-        self._update_sel_count()
+            cache_dir = os.path.join(tempfile.gettempdir(), "pahe_dl_thumbs")
+            os.makedirs(cache_dir, exist_ok=True)
+            ext = ".webp"
+            m = re.search(r"\.(webp|jpg|jpeg|png|gif)(?:\?|$)", url, re.I)
+            if m:
+                ext = "." + m.group(1).lower()
+            fpath = os.path.join(cache_dir, hashlib.md5(url.encode()).hexdigest() + ext)
+            if os.path.exists(fpath):
+                data = open(fpath, "rb").read()
+            else:
+                data = get_engine().fetch_image(url)
+                if not data:
+                    return ""
+                with open(fpath, "wb") as f:
+                    f.write(data)
+            ctype = mimetypes.guess_type(fpath)[0] or "image/webp"
+            return f"data:{ctype};base64," + base64.b64encode(data).decode("ascii")
+        except Exception as e:
+            _log(f"UI: get_image failed {type(e).__name__} {url[:70]}")
+            return ""
 
-    def _browse(self):
-        d = filedialog.askdirectory(initialdir=self._dir_var.get())
-        if d: self._dir_var.set(d)
+    def get_episodes(self, anime_id, title):
+        if not self._guard():
+            return False
+        self._current_title = title
+        self._set_status(f"Loading episodes for {title}…", "warn")
 
-    # ── Download ──────────────────────────────────────────────────────────────
+        def run():
+            try:
+                eps = fetch_episodes(anime_id)
+                payload = json.dumps({"episodes": eps, "title": title})
+                safe = payload.replace("\\", "\\\\").replace("`", "\\`")
+                if self._window:
+                    self._window.evaluate_js(f"window.renderEpisodes(JSON.parse(`{safe}`))")
+                self._set_status(f"Loaded {len(eps)} episodes for {title}.", "success")
+            except Exception as e:
+                self._set_status(f"Episode load error: {e}", "error")
+        threading.Thread(target=run, daemon=True).start()
+        return True
 
-    def _start_download(self):
-        selected = self._checklist.get_selected()
+    # ── download ────────────────────────────────────────────────────────────────
+    def choose_folder(self):
+        """Open a native folder picker, return the chosen path (or '')."""
+        if not self._window:
+            return ""
+        # pywebview renamed the folder-dialog constant; prefer the new one,
+        # fall back to the old for older pywebview versions.
+        try:
+            folder_mode = webview.FileDialog.FOLDER
+        except AttributeError:
+            folder_mode = webview.FOLDER_DIALOG
+        dirs = self._window.create_file_dialog(folder_mode)
+        if dirs:
+            return dirs[0] if isinstance(dirs, (list, tuple)) else dirs
+        return ""
+
+    def start_download(self, payload):
+        """
+        payload: {episodes:[{ep,title,session,anime_id}], dest, quality, audio,
+                  season, jellyfin(bool)}
+        """
+        if self._downloading:
+            self._set_status("A download is already running.", "warn")
+            return False
+        selected = payload.get("episodes", [])
         if not selected:
-            messagebox.showwarning("Nothing selected", "Tick at least one episode.")
-            return
-        dest = self._dir_var.get().strip()
+            self._set_status("Tick at least one episode.", "error")
+            return False
+        dest = (payload.get("dest") or "").strip()
         if not dest or not os.path.isdir(dest):
-            messagebox.showerror("Bad directory", "Choose a valid download folder.")
-            return
+            self._set_status("Choose a valid download folder.", "error")
+            return False
+
+        quality = str(payload.get("quality", "1080"))
+        audio   = str(payload.get("audio", "jpn"))
+        season  = int(payload.get("season", 1) or 1)
+        jellyfin = bool(payload.get("jellyfin", True))
+        batch_title = self._current_title
 
         self._stop_event.clear()
-        self._dl_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-        self._progress["value"] = 0
-        # Snapshot the title NOW so clicking another result mid-download can't
-        # change the folder/filename of the in-progress batch.
-        batch_title = getattr(self, "_current_anime_title", "")
+        self._downloading = True
+        self._set_progress(0, "")
 
         def run():
             import traceback
             total = len(selected)
             idx = 0
-            rl_strikes = 0     # consecutive rate-limit hits
-            ctx_strikes = 0    # consecutive dead-context hits
-            res_strikes = 0    # consecutive resolve failures (Kwik throttling)
-            while idx < len(selected):
-                item = selected[idx]
-                if self._stop_event.is_set():
-                    self.after(0, lambda: self._set_status("Stopped.", WARN))
-                    break
-
-                ep_num = item["ep"]
-                print(f"\n[DL] Starting Ep {ep_num} | anime_id={item['anime_id']} | session={item['session'][:16]}…")
-                self.after(0, lambda n=ep_num, i=idx:
-                    self._set_status(f"[{i+1}/{total}] Finding download link for Ep {n}…", WARN))
-
-                try:
-                    print(f"[DL] Calling get_download_options…")
-                    options, scraped_title = get_download_options(item["anime_id"], item["session"])
-                    print(f"[DL] {len(options)} option(s): " +
-                          ", ".join(f"{o['quality']}p/{o['audio']}" for o in options))
-
-                    if not options:
-                        msg = f"Ep {ep_num}: No download links found — skipping."
-                        print(f"[DL] {msg}")
-                        self.after(0, lambda n=ep_num, m=msg:
-                            self._set_status(m, ERROR))
-                        idx += 1
-                        continue
-
-                    chosen = pick_download_option(options, self._quality_var.get(), self._audio_var.get())
-                    print(f"[DL] chosen: {chosen['label']!r} -> {chosen['url']}")
-
-                    print(f"[DL] Resolving {chosen['url']}…")
-                    result = resolve_download(chosen["url"])
-                    if not result:
-                        # Transient kwik/pahe hiccup — re-scrape (links rotate)
-                        # and try once more before giving up on this episode.
-                        print(f"[DL] resolve failed, retrying once…")
-                        self.after(0, lambda n=ep_num:
-                            self._set_status(f"Ep {n}: link slow, retrying…", WARN))
-                        options2, _ = get_download_options(item["anime_id"], item["session"])
-                        if options2:
-                            chosen2 = pick_download_option(options2, self._quality_var.get(), self._audio_var.get())
-                            result = resolve_download(chosen2["url"])
-                            if result:
-                                chosen = chosen2
-                    print(f"[DL] resolve result={result!r}")
-
-                    if not result:
-                        # Repeated resolve failures usually mean Kwik is throttling
-                        # us after many rapid downloads. Back off (progressively),
-                        # then RETRY the same episode rather than skipping it.
-                        res_strikes += 1
-                        if res_strikes <= 3:
-                            wait_s = min(120, 30 * res_strikes)
-                            print(f"[DL] resolve throttled (strike {res_strikes}); cooling down {wait_s}s then retrying Ep {ep_num}.")
-                            for remaining in range(wait_s, 0, -1):
-                                if self._stop_event.is_set():
-                                    break
-                                self.after(0, lambda r=remaining, n=ep_num:
-                                    self._set_status(f"Links throttled — waiting {r}s before retrying Ep {n}…", WARN))
-                                time.sleep(1)
-                            continue   # retry same episode (idx not advanced)
-                        # Gave it several tries with cooldowns — skip and move on.
-                        msg = f"Ep {ep_num}: Could not resolve after retries — skipping."
-                        print(f"[DL] {msg}")
-                        self.after(0, lambda n=ep_num, m=msg:
-                            self._set_status(m, ERROR))
-                        res_strikes = 0
-                        idx += 1
-                        continue
-
-                    # Resolve succeeded — reset the throttle counter.
-                    res_strikes = 0
-
-                    direct_url, extra_hdrs = result
-                    print(f"[DL] direct_url={direct_url!r}")
-
-                    # Build filename. Jellyfin wants "Series SxxEyy" and, ideally,
-                    # each series in its own folder.
-                    anime_title = batch_title or item["title"] or scraped_title
-                    safe_title = re.sub(r'[\\/:*?"<>|]', "", anime_title).strip() or "Unknown"
-                    season = int(self._season_var.get() or 1)
-                    ep_int = int(re.sub(r"\D", "", str(ep_num)) or 0)
-                    se_tag = f"S{season:02d}E{ep_int:02d}"
-
-                    if self._jellyfin_var.get():
-                        # Jellyfin layout: <dest>/<Series>/<Series> SxxEyy.mp4
-                        series_dir = os.path.join(dest, safe_title)
-                        os.makedirs(series_dir, exist_ok=True)
-                        fname = f"{safe_title} - {se_tag} [{chosen['quality']}p].mp4"
-                        dest_path = os.path.join(series_dir, fname)
-                    else:
-                        fname = f"{safe_title} - Ep{str(ep_num).zfill(3)} [{chosen['quality']}p].mp4"
-                        dest_path = os.path.join(dest, fname)
-                    print(f"[DL] Saving to: {dest_path}")
-
-                    self.after(0, lambda n=ep_num, i=idx:
-                        self._set_status(f"[{i+1}/{total}] Downloading Ep {n}…", TEXT))
-
-                    def file_prog(frac, ep_done=idx):
-                        overall = (ep_done + frac) / total * 100
-                        self.after(0, lambda v=overall: self._progress.configure(value=v))
-
-                    print(f"[DL] Starting file download…")
-                    ok = pw_download(direct_url, dest_path, extra_hdrs,
-                                       progress_cb=file_prog,
-                                       stop_event=self._stop_event)
-                    print(f"[DL] pw_download returned: {ok}")
-                    if not ok:
+            rl_strikes = ctx_strikes = res_strikes = 0
+            try:
+                while idx < len(selected):
+                    item = selected[idx]
+                    if self._stop_event.is_set():
+                        self._set_status("Stopped.", "warn")
                         break
+                    ep_num = item["ep"]
+                    print(f"\n[DL] Starting Ep {ep_num} | anime_id={item['anime_id']} | session={item['session'][:16]}…")
+                    self._set_status(f"[{idx+1}/{total}] Finding download link for Ep {ep_num}…", "warn")
+                    try:
+                        options, scraped_title = get_download_options(item["anime_id"], item["session"])
+                        if not options:
+                            self._set_status(f"Ep {ep_num}: No download links — skipping.", "error")
+                            idx += 1; continue
+                        chosen = pick_download_option(options, quality, audio)
+                        result = resolve_download(chosen["url"])
+                        if not result:
+                            self._set_status(f"Ep {ep_num}: link slow, retrying…", "warn")
+                            options2, _ = get_download_options(item["anime_id"], item["session"])
+                            if options2:
+                                chosen2 = pick_download_option(options2, quality, audio)
+                                result = resolve_download(chosen2["url"])
+                                if result: chosen = chosen2
+                        if not result:
+                            res_strikes += 1
+                            if res_strikes <= 3:
+                                wait_s = min(120, 30 * res_strikes)
+                                for r in range(wait_s, 0, -1):
+                                    if self._stop_event.is_set(): break
+                                    self._set_status(f"Links throttled — waiting {r}s before retrying Ep {ep_num}…", "warn")
+                                    time.sleep(1)
+                                continue
+                            self._set_status(f"Ep {ep_num}: Could not resolve after retries — skipping.", "error")
+                            res_strikes = 0; idx += 1; continue
+                        res_strikes = 0
+                        direct_url, extra_hdrs = result
 
-                    # success — reset the strike counters and advance
-                    rl_strikes = 0
-                    ctx_strikes = 0
-                    idx += 1
+                        anime_title = batch_title or item.get("title") or scraped_title
+                        safe_title = re.sub(r'[\\/:*?"<>|]', "", anime_title).strip() or "Unknown"
+                        ep_int = int(re.sub(r"\D", "", str(ep_num)) or 0)
+                        se_tag = f"S{season:02d}E{ep_int:02d}"
+                        if jellyfin:
+                            series_dir = os.path.join(dest, safe_title)
+                            os.makedirs(series_dir, exist_ok=True)
+                            fname = f"{safe_title} - {se_tag} [{chosen['quality']}p].mp4"
+                            dest_path = os.path.join(series_dir, fname)
+                        else:
+                            fname = f"{safe_title} - Ep{str(ep_num).zfill(3)} [{chosen['quality']}p].mp4"
+                            dest_path = os.path.join(dest, fname)
 
-                except RateLimited:
-                    # AnimePahe is rate-limiting us. Wait a while, then RETRY the
-                    # same episode (don't advance idx). Back off progressively.
-                    rl_strikes += 1
-                    wait_s = min(120, 30 * rl_strikes)
-                    print(f"[DL] RATE LIMITED (429). Cooling down {wait_s}s, then retrying Ep {ep_num}.")
-                    for remaining in range(wait_s, 0, -1):
-                        if self._stop_event.is_set():
+                        self._set_status(f"[{idx+1}/{total}] Downloading Ep {ep_num}…", "info")
+
+                        def file_prog(frac, ep_done=idx):
+                            overall = (ep_done + frac) / total * 100
+                            self._set_progress(overall, f"Ep {ep_num} · {int(frac*100)}%")
+
+                        ok = pw_download(direct_url, dest_path, extra_hdrs,
+                                         progress_cb=file_prog, stop_event=self._stop_event)
+                        if not ok:
                             break
-                        self.after(0, lambda r=remaining, n=ep_num:
-                            self._set_status(f"Rate limited — waiting {r}s before retrying Ep {n}…", WARN))
-                        time.sleep(1)
-                    # do NOT increment idx — retry the same episode
-                    continue
+                        rl_strikes = ctx_strikes = 0
+                        idx += 1
+                    except RateLimited:
+                        rl_strikes += 1
+                        wait_s = min(120, 30 * rl_strikes)
+                        for r in range(wait_s, 0, -1):
+                            if self._stop_event.is_set(): break
+                            self._set_status(f"Rate limited — waiting {r}s before retrying Ep {ep_num}…", "warn")
+                            time.sleep(1)
+                        continue
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        print(f"[DL] EXCEPTION for Ep {ep_num}:\n{tb}")
+                        if "TargetClosedError" in tb or "Target page" in str(e):
+                            ctx_strikes += 1
+                            if ctx_strikes <= 3:
+                                for r in range(15, 0, -1):
+                                    if self._stop_event.is_set(): break
+                                    self._set_status(f"Browser reset — waiting {r}s before retrying Ep {ep_num}…", "warn")
+                                    time.sleep(1)
+                                continue
+                        self._set_status(f"Ep {ep_num} error: {e}", "error")
+                        idx += 1; continue
 
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    print(f"[DL] EXCEPTION for Ep {ep_num}:\n{tb}")
-                    # A dead browser context (TargetClosedError) often follows a
-                    # rate-limit or network drop. Pause so the relaunched browser
-                    # can settle, then retry the SAME episode once before skipping.
-                    if "TargetClosedError" in tb or "Target page" in str(e):
-                        ctx_strikes += 1
-                        if ctx_strikes <= 3:
-                            print(f"[DL] context died, cooldown 15s then retry (strike {ctx_strikes})")
-                            for remaining in range(15, 0, -1):
-                                if self._stop_event.is_set():
-                                    break
-                                self.after(0, lambda r=remaining, n=ep_num:
-                                    self._set_status(f"Browser reset — waiting {r}s before retrying Ep {n}…", WARN))
-                                time.sleep(1)
-                            continue   # retry same episode
-                    self.after(0, lambda n=ep_num, err=str(e):
-                        self._set_status(f"Ep {n} error: {err}", ERROR))
-                    idx += 1
-                    continue
+                    self._set_progress(idx / total * 100, "")
+                    if idx < len(selected) and not self._stop_event.is_set():
+                        time.sleep(1.5)
 
-                overall = idx / total * 100
-                self.after(0, lambda v=overall: self._progress.configure(value=v))
-
-                # Small polite pause between episodes on long batches to avoid
-                # tripping AnimePahe's rate limiter (HTTP 429).
-                if idx < len(selected) and not self._stop_event.is_set():
-                    time.sleep(1.5)
-                self.after(0, lambda: (
-                    self._set_status(f"Done! {total} episode(s) saved to {dest}", SUCCESS),
-                    self._progress.configure(value=100),
-                ))
-            self.after(0, lambda: (
-                self._dl_btn.config(state="normal"),
-                self._stop_btn.config(state="disabled"),
-            ))
+                if not self._stop_event.is_set():
+                    self._set_status(f"Done! {total} episode(s) saved to {dest}", "success")
+                    self._set_progress(100, "Complete")
+            finally:
+                self._downloading = False
 
         threading.Thread(target=run, daemon=True).start()
+        return True
 
-    def _stop_download(self):
+    def stop_download(self):
         self._stop_event.set()
-        self._stop_btn.config(state="disabled")
-        self._set_status("Stopping after current file…", WARN)
+        self._set_status("Stopping after current file…", "warn")
+        return True
 
-    def _set_status(self, msg, color=SUBTEXT):
-        self._status_var.set(msg)
-        self._status_lbl.config(fg=color)
 
-    def _on_close(self):
-        """Shut the browser engine down cleanly, then close the window."""
-        try:
-            if _engine is not None:
-                _engine.shutdown()
-        except Exception:
-            pass
-        self.destroy()
+def _on_closed():
+    try:
+        if _engine is not None:
+            _engine.shutdown()
+    except Exception:
+        pass
+
+
+def main():
+    api = Api()
+
+    # WebKitGTK (Linux) can fail to paint a large inline html= string, leaving a
+    # blank window. Writing the page to a temp file and loading it by URL is the
+    # reliable path across backends.
+    import tempfile
+    html_path = os.path.join(tempfile.gettempdir(), "pahe_dl_ui.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(INDEX_HTML)
+    _log(f"UI: wrote frontend to {html_path}")
+
+    window = webview.create_window(
+        "PAHE DL",
+        url=html_path,
+        js_api=api,
+        width=1180, height=780, min_size=(940, 600),
+        background_color="#0a0a14",
+    )
+    api._window = window
+    window.events.closed += _on_closed
+
+    def boot():
+        # Wait until the bridge is ready, then start the engine.
+        api.start_engine()
+
+    webview.start(boot, debug=False)
 
 
 if __name__ == "__main__":
-    app = AnimePaheApp()
-    app.protocol("WM_DELETE_WINDOW", app._on_close)
-    app.mainloop()
+    main()
