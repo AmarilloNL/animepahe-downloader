@@ -112,29 +112,40 @@ def _log(msg: str):
 _engine: "BrowserEngine | None" = None
 
 
-def _ensure_chromium_installed():
+def _chromium_present():
+    import glob
+    if os.name == "nt":
+        base = os.path.join(os.environ.get("USERPROFILE", ""),
+                            "AppData", "Local", "ms-playwright")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    return any(os.path.isdir(c) for c in glob.glob(os.path.join(base, "chromium-*")))
+
+
+def _ensure_chromium_installed(status_cb=None):
     """
     Make sure Patchright's Chromium is present. In a packaged build (the Windows
     .exe) the user never ran `patchright install chromium`, so the browser won't
-    exist on first launch. Detect that and install it automatically, once.
+    exist on first launch. Detect that and install it automatically, once,
+    reporting progress to the UI via status_cb instead of a separate console.
 
     NOTE: in a PyInstaller --onefile build, sys.executable is the .exe itself, so
     we must NOT spawn `sys.executable -m patchright …` — that would relaunch the
     whole app in a loop. We invoke patchright's install routine in-process.
     """
     try:
-        import glob
+        if _chromium_present():
+            return
+        msg = "First run: downloading the browser engine (~180 MB, one-time)…"
+        _log("ENGINE: " + msg)
+        if status_cb:
+            status_cb(msg)
+
+        # Hide the child console the patchright driver (node.exe) spawns on
+        # Windows, so no black terminal pops up.
         if os.name == "nt":
-            base = os.path.join(os.environ.get("USERPROFILE", ""),
-                                "AppData", "Local", "ms-playwright")
-        else:
-            base = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
-        if any(os.path.isdir(c) for c in glob.glob(os.path.join(base, "chromium-*"))):
-            return  # already installed
-        _log("ENGINE: Chromium not found — installing (first run, one-time)…")
-        # Call patchright's CLI entry point in-process (works whether we're a
-        # normal Python run or a frozen .exe).
-        import sys
+            os.environ.setdefault("PLAYWRIGHT_NODEJS_NO_WINDOW", "1")
+
         old_argv = sys.argv
         try:
             sys.argv = ["patchright", "install", "chromium"]
@@ -148,9 +159,14 @@ def _ensure_chromium_installed():
                 pass   # the CLI calls sys.exit() on completion
         finally:
             sys.argv = old_argv
+
         _log("ENGINE: Chromium install finished.")
+        if status_cb:
+            status_cb("Browser engine installed ✓")
     except Exception as e:
         _log(f"ENGINE: chromium auto-install skipped ({type(e).__name__})")
+        if status_cb:
+            status_cb("Couldn't auto-install the browser — see engine.log.")
 
 
 class RateLimited(Exception):
@@ -205,7 +221,7 @@ class BrowserEngine:
                     pass
 
             _log("ENGINE: starting sync_playwright()")
-            _ensure_chromium_installed()
+            _ensure_chromium_installed(status_cb=self._status_cb)
             self._pw = sync_playwright().start()
             _log("ENGINE: sync_playwright started")
 
@@ -373,17 +389,38 @@ class BrowserEngine:
     def _window_state(self, state: str):
         """Set the browser window state via CDP: 'minimized' or 'normal'.
         Keeps the SAME browser alive (no relaunch), so Cloudflare clearance
-        is never lost."""
+        is never lost. If 'minimized' is rejected (some Windows Chromium builds
+        refuse it), fall back to moving the window off-screen."""
         try:
             page = self._main_page()
             session = self._ctx.new_cdp_session(page)
             ids = session.send("Browser.getWindowForTarget")
             win_id = ids["windowId"]
-            session.send("Browser.setWindowBounds", {
-                "windowId": win_id,
-                "bounds": {"windowState": state},
-            })
-            _log(f"WINDOW: set state={state}")
+            try:
+                session.send("Browser.setWindowBounds", {
+                    "windowId": win_id,
+                    "bounds": {"windowState": state},
+                })
+                _log(f"WINDOW: set state={state}")
+            except Exception as e1:
+                # Windows sometimes rejects windowState:minimized. Fall back to
+                # shoving the window off-screen (works everywhere).
+                if state == "minimized":
+                    try:
+                        # must be 'normal' before setting explicit bounds
+                        session.send("Browser.setWindowBounds",
+                                     {"windowId": win_id, "bounds": {"windowState": "normal"}})
+                        session.send("Browser.setWindowBounds", {
+                            "windowId": win_id,
+                            "bounds": {"left": -32000, "top": -32000,
+                                       "width": 1100, "height": 760},
+                        })
+                        _log("WINDOW: minimized rejected; moved off-screen instead")
+                    except Exception as e2:
+                        _log(f"WINDOW: offscreen fallback failed {type(e2).__name__}")
+                        raise
+                else:
+                    raise
             try: session.detach()
             except Exception: pass
             return True
@@ -398,7 +435,21 @@ class BrowserEngine:
 
     def _go_visible(self):
         """Restore + focus the browser window so the user can re-solve."""
-        self._window_state("normal")
+        # Explicitly bring it back on-screen (in case we hid it off-screen).
+        try:
+            page = self._main_page()
+            session = self._ctx.new_cdp_session(page)
+            win_id = session.send("Browser.getWindowForTarget")["windowId"]
+            session.send("Browser.setWindowBounds",
+                         {"windowId": win_id, "bounds": {"windowState": "normal"}})
+            session.send("Browser.setWindowBounds", {
+                "windowId": win_id,
+                "bounds": {"left": 80, "top": 80, "width": 1100, "height": 760},
+            })
+            try: session.detach()
+            except Exception: pass
+        except Exception:
+            self._window_state("normal")
         self._minimized = False
         try:
             self._main_page().bring_to_front()
@@ -640,42 +691,60 @@ class BrowserEngine:
             # kwik do we check for a real Cloudflare challenge.
             cur = page.url or ""
             if "pahe.win" in cur:
+                # pahe.win injects fake "Adblocker / Install / I'm not a robot"
+                # ad-overlays. Clicking buttons risks hitting an ad. So FIRST try
+                # to pull the real kwik link straight out of the page HTML and
+                # navigate to it directly — this skips the ad gauntlet entirely.
                 for _ in range(4):
                     if "kwik." in (page.url or ""):
                         break
-                    clicked = False
-                    for sel in ("text=Continue", "a:has-text('Continue')",
-                                "button:has-text('Continue')", "input[type=submit]",
-                                "a.btn", "button.btn", "a[href*='kwik.']", "form button"):
+                    html = ""
+                    try:
+                        html = page.content()
+                    except Exception:
+                        pass
+                    km = re.search(r'https://kwik\.[a-z]+/f/[A-Za-z0-9]+', html)
+                    if km:
+                        _log(f"DLRES: pahe→kwik (embedded) {km.group(0)}")
                         try:
-                            el = page.query_selector(sel)
-                            if el and el.is_visible():
-                                _log(f"DLRES: clicking pahe.win '{sel}'")
+                            page.goto(km.group(0), wait_until="commit", timeout=20000)
+                            page.wait_for_load_state("domcontentloaded", timeout=8000)
+                        except Exception:
+                            pass
+                        self._reassert_minimized()
+                        break
+
+                    # No embedded link yet — click ONLY a real continue/kwik
+                    # control, never generic ad buttons. We explicitly skip
+                    # anything that looks like an ad ("Install", "robot", etc.).
+                    clicked = False
+                    for sel in ("a[href*='kwik.']",
+                                "a:has-text('Continue')",
+                                "button:has-text('Continue')",
+                                "form[action*='kwik'] button",
+                                "form button[type=submit]"):
+                        try:
+                            for el in page.query_selector_all(sel):
+                                if not el.is_visible():
+                                    continue
+                                label = (el.inner_text() or "").strip().lower()
+                                # Skip obvious ad buttons.
+                                if any(bad in label for bad in
+                                       ("install", "robot", "adblock", "update", "download app")):
+                                    continue
+                                _log(f"DLRES: clicking pahe.win '{sel}' ({label[:20]!r})")
                                 el.click()
                                 clicked = True
                                 break
+                            if clicked:
+                                break
                         except Exception:
                             continue
-                    # Wait for the redirect to kwik after clicking.
                     try:
                         page.wait_for_url(re.compile(r"kwik\."), timeout=12000)
                     except Exception:
                         page.wait_for_timeout(2000)
                     self._reassert_minimized()
-                    if not clicked:
-                        # No button found this round; maybe a meta-refresh is
-                        # pending, or the kwik link is embedded in the HTML.
-                        html = page.content()
-                        km = re.search(r'https://kwik\.[a-z]+/f/[A-Za-z0-9]+', html)
-                        if km:
-                            _log(f"DLRES: pahe→kwik (embedded) {km.group(0)}")
-                            try:
-                                page.goto(km.group(0), wait_until="commit", timeout=20000)
-                                page.wait_for_load_state("domcontentloaded", timeout=8000)
-                            except Exception:
-                                pass
-                            break
-                        page.wait_for_timeout(2000)
 
                 if "pahe.win" in (page.url or ""):
                     _log("DLRES: could not get past pahe.win gate")
@@ -972,25 +1041,43 @@ def fetch_catalog(status_cb=None) -> list[dict]:
 
 
 def search_anime(query: str, status_cb=None) -> list[dict]:
-    # Primary: JSON API via in-page fetch
+    # Primary: JSON API via in-page fetch. The API returns 8 results per page,
+    # so we page through all of them (up to a sane cap) to show every match.
     text = pw_get(API_URL, params={"m": "search", "q": query})
     print(f"[SEARCH] api response (first 300): {text[:300]!r}")
     stripped = text.lstrip("\ufeff \t\r\n")
     if stripped[:1] in ("{", "["):
         data  = json.loads(stripped)
         items = data if isinstance(data, list) else data.get("data", [])
-        if items:
-            return [{
-                "id":       i.get("session", i.get("id", "")),
-                "title":    i.get("title", "Unknown"),
-                "year":     str(i.get("year", "")),
-                "status":   i.get("status", ""),
-                "episodes": i.get("episodes", "?"),
-                "type":     i.get("type", ""),
-                "poster":   i.get("poster", ""),
-            } for i in items]
-        # Valid JSON but no matches — that's a genuine empty result
-        return []
+        results = []
+
+        def _add(lst):
+            for i in lst:
+                results.append({
+                    "id":       i.get("session", i.get("id", "")),
+                    "title":    i.get("title", "Unknown"),
+                    "year":     str(i.get("year", "")),
+                    "status":   i.get("status", ""),
+                    "episodes": i.get("episodes", "?"),
+                    "type":     i.get("type", ""),
+                    "poster":   i.get("poster", ""),
+                })
+
+        _add(items)
+        # Follow pagination if the API reports more pages.
+        if isinstance(data, dict):
+            last_page = int(data.get("last_page", 1) or 1)
+            for page in range(2, min(last_page, 15) + 1):  # cap at 15 pages (~120)
+                if status_cb:
+                    status_cb(f"Loading results… page {page}/{last_page}")
+                t2 = pw_get(API_URL, params={"m": "search", "q": query, "page": page})
+                s2 = t2.lstrip("\ufeff \t\r\n")
+                if s2[:1] != "{":
+                    break
+                d2 = json.loads(s2)
+                _add(d2.get("data", []))
+                time.sleep(0.25)
+        return results
 
     # The API didn't return JSON (HTML challenge page, redirect, etc.).
     # Fall back to scraping the /anime search page.
