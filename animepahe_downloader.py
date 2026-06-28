@@ -1077,11 +1077,20 @@ def search_anime(query: str, status_cb=None) -> list[dict]:
         data  = json.loads(stripped)
         items = data if isinstance(data, list) else data.get("data", [])
         results = []
+        seen = set()
 
         def _add(lst):
+            """Add results, skipping any anime we've already collected. Returns
+            how many NEW items were added."""
+            added = 0
             for i in lst:
+                sid = i.get("session", i.get("id", ""))
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                added += 1
                 results.append({
-                    "id":       i.get("session", i.get("id", "")),
+                    "id":       sid,
                     "title":    i.get("title", "Unknown"),
                     "year":     str(i.get("year", "")),
                     "status":   i.get("status", ""),
@@ -1089,12 +1098,15 @@ def search_anime(query: str, status_cb=None) -> list[dict]:
                     "type":     i.get("type", ""),
                     "poster":   i.get("poster", ""),
                 })
+            return added
 
         _add(items)
-        # Follow pagination if the API reports more pages.
+        # Follow pagination if the API reports more pages. AnimePahe's search
+        # sometimes ignores &page and re-returns page 1, so we dedupe and stop
+        # the moment a page contributes nothing new.
         if isinstance(data, dict):
             last_page = int(data.get("last_page", 1) or 1)
-            for page in range(2, min(last_page, 15) + 1):  # cap at 15 pages (~120)
+            for page in range(2, min(last_page, 15) + 1):
                 if status_cb:
                     status_cb(f"Loading results… page {page}/{last_page}")
                 t2 = pw_get(API_URL, params={"m": "search", "q": query, "page": page})
@@ -1102,7 +1114,8 @@ def search_anime(query: str, status_cb=None) -> list[dict]:
                 if s2[:1] != "{":
                     break
                 d2 = json.loads(s2)
-                _add(d2.get("data", []))
+                if _add(d2.get("data", [])) == 0:
+                    break   # page added nothing new — pagination isn't working
                 time.sleep(0.25)
         return results
 
