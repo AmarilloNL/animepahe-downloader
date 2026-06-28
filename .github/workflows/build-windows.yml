@@ -1,28 +1,33 @@
 name: Build Windows EXE
 
-# Build the .exe when you push a version tag (e.g. v2.0.0), or on demand.
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:        # lets you run it manually from the Actions tab
+  workflow_dispatch:
 
 permissions:
-  contents: write           # needed to upload the .exe to a Release
+  contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pin an explicit x64 Windows runner (windows-latest can vary).
+    runs-on: windows-2022
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Force x64 Python so pywebview loads the x64 WebView2 DLLs, not arm64.
       - name: Set up Python (x64)
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           architecture: 'x64'
+
+      - name: Show architecture (diagnostic)
+        shell: pwsh
+        run: |
+          python -c "import platform; print('python arch:', platform.machine(), platform.architecture())"
+          echo "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
 
       - name: Install dependencies
         run: |
@@ -30,22 +35,31 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller pythonnet clr_loader
 
-      # Locate pywebview's bundled WebView2 DLLs so we can add them explicitly;
-      # the auto-hook sometimes misses them, which causes the win-arm64 error.
       - name: Build EXE
         shell: pwsh
         run: |
+          # Bundle pywebview's entire lib folder (all WebView2 + interop DLLs for
+          # every architecture) so interop_dll_path always finds what it asks for,
+          # whether it computes win-x64, win-x86, or win-arm64.
           $lib = python -c "import os, webview; print(os.path.join(os.path.dirname(webview.__file__), 'lib'))"
           Write-Host "webview lib dir: $lib"
+          Get-ChildItem -Recurse $lib | Select-Object FullName | Format-Table -AutoSize
+
           pyinstaller --onefile --noconsole `
             --name "AnimePaheDownloader" `
+            --icon "app_icon.ico" `
             --collect-all patchright `
             --collect-all webview `
             --collect-all bs4 `
+            --collect-all clr_loader `
+            --collect-all pythonnet `
             --hidden-import clr `
             --hidden-import clr_loader `
             --hidden-import pythonnet `
             --add-data "$lib;webview/lib" `
+            --add-data "$lib;webview\lib" `
+            --add-data "app_icon.ico;." `
+            --add-data "icon.png;." `
             animepahe_downloader.py
 
       - name: Upload build artifact

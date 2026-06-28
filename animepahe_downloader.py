@@ -32,6 +32,12 @@ How it works:
 """
 
 import os
+import sys
+# PyInstaller-frozen Windows builds: this MUST run before anything that can
+# spawn a subprocess, or child processes relaunch the whole GUI in a loop.
+import multiprocessing
+multiprocessing.freeze_support()
+
 # WebKitGTK on Linux (esp. Arch/CachyOS) often renders a blank window due to a
 # DMABUF/GPU-compositing bug. Disabling those renderers forces software paint,
 # which fixes the blank-window symptom. Must be set BEFORE importing webview.
@@ -111,30 +117,37 @@ def _ensure_chromium_installed():
     Make sure Patchright's Chromium is present. In a packaged build (the Windows
     .exe) the user never ran `patchright install chromium`, so the browser won't
     exist on first launch. Detect that and install it automatically, once.
+
+    NOTE: in a PyInstaller --onefile build, sys.executable is the .exe itself, so
+    we must NOT spawn `sys.executable -m patchright …` — that would relaunch the
+    whole app in a loop. We invoke patchright's install routine in-process.
     """
     try:
-        from patchright._impl._driver import compute_driver_executable
-    except Exception:
-        compute_driver_executable = None
-    try:
-        # Quick heuristic: ask patchright where its browsers live; if the
-        # chromium folder is missing/empty, trigger an install.
-        import glob, sys, subprocess
-        # Patchright stores browsers under ms-playwright in the user cache.
-        candidates = []
+        import glob
         if os.name == "nt":
             base = os.path.join(os.environ.get("USERPROFILE", ""),
                                 "AppData", "Local", "ms-playwright")
         else:
             base = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
-        candidates = glob.glob(os.path.join(base, "chromium-*"))
-        have = any(os.path.isdir(c) for c in candidates)
-        if have:
-            return
+        if any(os.path.isdir(c) for c in glob.glob(os.path.join(base, "chromium-*"))):
+            return  # already installed
         _log("ENGINE: Chromium not found — installing (first run, one-time)…")
-        # Run the patchright CLI in this same interpreter.
-        subprocess.run([sys.executable, "-m", "patchright", "install", "chromium"],
-                       check=False)
+        # Call patchright's CLI entry point in-process (works whether we're a
+        # normal Python run or a frozen .exe).
+        import sys
+        old_argv = sys.argv
+        try:
+            sys.argv = ["patchright", "install", "chromium"]
+            try:
+                from patchright.__main__ import main as _pr_main
+            except Exception:
+                from playwright.__main__ import main as _pr_main
+            try:
+                _pr_main()
+            except SystemExit:
+                pass   # the CLI calls sys.exit() on completion
+        finally:
+            sys.argv = old_argv
         _log("ENGINE: Chromium install finished.")
     except Exception as e:
         _log(f"ENGINE: chromium auto-install skipped ({type(e).__name__})")
@@ -2147,7 +2160,24 @@ def main():
         # Wait until the bridge is ready, then start the engine.
         api.start_engine()
 
-    webview.start(boot, debug=False)
+    # Use the bundled icon if we can find it (works in both source and frozen
+    # builds). Not all pywebview backends honour it, so it's best-effort.
+    icon_path = None
+    for cand in ("app_icon.ico", "icon.png"):
+        # When frozen, PyInstaller unpacks data next to sys._MEIPASS.
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        p = os.path.join(base, cand)
+        if os.path.exists(p):
+            icon_path = p
+            break
+    try:
+        if icon_path:
+            webview.start(boot, debug=False, icon=icon_path)
+        else:
+            webview.start(boot, debug=False)
+    except TypeError:
+        # Older pywebview without the icon kwarg
+        webview.start(boot, debug=False)
 
 
 if __name__ == "__main__":
