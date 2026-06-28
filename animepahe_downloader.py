@@ -106,6 +106,40 @@ def _log(msg: str):
 _engine: "BrowserEngine | None" = None
 
 
+def _ensure_chromium_installed():
+    """
+    Make sure Patchright's Chromium is present. In a packaged build (the Windows
+    .exe) the user never ran `patchright install chromium`, so the browser won't
+    exist on first launch. Detect that and install it automatically, once.
+    """
+    try:
+        from patchright._impl._driver import compute_driver_executable
+    except Exception:
+        compute_driver_executable = None
+    try:
+        # Quick heuristic: ask patchright where its browsers live; if the
+        # chromium folder is missing/empty, trigger an install.
+        import glob, sys, subprocess
+        # Patchright stores browsers under ms-playwright in the user cache.
+        candidates = []
+        if os.name == "nt":
+            base = os.path.join(os.environ.get("USERPROFILE", ""),
+                                "AppData", "Local", "ms-playwright")
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+        candidates = glob.glob(os.path.join(base, "chromium-*"))
+        have = any(os.path.isdir(c) for c in candidates)
+        if have:
+            return
+        _log("ENGINE: Chromium not found — installing (first run, one-time)…")
+        # Run the patchright CLI in this same interpreter.
+        subprocess.run([sys.executable, "-m", "patchright", "install", "chromium"],
+                       check=False)
+        _log("ENGINE: Chromium install finished.")
+    except Exception as e:
+        _log(f"ENGINE: chromium auto-install skipped ({type(e).__name__})")
+
+
 class RateLimited(Exception):
     """Raised when AnimePahe returns HTTP 429 (too many requests)."""
     pass
@@ -158,6 +192,7 @@ class BrowserEngine:
                     pass
 
             _log("ENGINE: starting sync_playwright()")
+            _ensure_chromium_installed()
             self._pw = sync_playwright().start()
             _log("ENGINE: sync_playwright started")
 
@@ -1260,9 +1295,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .btn-stop:disabled{opacity:.35; cursor:default}
 
   .folder{display:flex; gap:8px; align-items:center}
-  .folder .path{flex:1; font-size:11px; color:var(--sub); background:var(--card);
-    border:1px solid var(--border); border-radius:8px; padding:8px 10px;
-    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; user-select:text}
+  .folder .path{flex:1; font-size:11.5px; color:var(--text); background:var(--card);
+    border:1px solid var(--border); border-radius:8px; padding:9px 11px;
+    white-space:nowrap; user-select:text; outline:none; font-family:inherit;
+    transition:.15s}
+  .folder .path::placeholder{color:var(--muted)}
+  .folder .path:focus{border-color:var(--magenta); box-shadow:0 0 0 2px #e94aff22}
+  .folder .path.ok{border-color:var(--success)}
+  .folder .path.bad{border-color:var(--error)}
+  .folder-hint{font-size:10.5px; line-height:1.5; white-space:pre-wrap;
+    color:var(--muted); padding:0 2px; max-height:0; overflow:hidden;
+    transition:max-height .2s}
+  .folder-hint.ok{color:var(--success); max-height:60px}
+  .folder-hint.bad{color:var(--warn); max-height:140px;
+    font-family:ui-monospace,monospace; user-select:text}
 
   /* ── progress + status ──────────────────────────────── */
   .prog{height:8px; background:var(--card); border-radius:6px; overflow:hidden;
@@ -1347,9 +1393,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <label class="chk"><input type="checkbox" id="jellyfin" checked>Jellyfin naming</label>
         </div>
         <div class="folder">
-          <div class="path" id="folderPath">No folder selected</div>
+          <input class="path" id="folderPath" placeholder="Paste a folder path or smb:// share, or use Folder…">
           <button class="btn btn-ghost" onclick="chooseFolder()">Folder…</button>
         </div>
+        <div class="folder-hint" id="folderHint"></div>
         <div class="prog"><div class="fill" id="progFill"></div></div>
         <div class="dlbar">
           <button class="btn btn-dl" id="btnDl" onclick="startDownload()" disabled>Download</button>
@@ -1529,8 +1576,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
   async function chooseFolder(){
     if(!apiReady)return;
     const f = await api().choose_folder();
-    if(f){ FOLDER=f; document.getElementById('folderPath').textContent=f; updateDlState(); }
+    if(f){
+      document.getElementById('folderPath').value = f;
+      setFolder(f);
+    }
   }
+
+  // Validate / resolve a typed/pasted/picked path. Handles smb:// URLs by
+  // finding their mount (or showing guidance).
+  let _folderTimer=null;
+  async function setFolder(path){
+    const el = document.getElementById('folderPath');
+    const hintEl = document.getElementById('folderHint');
+    const raw = (path||'').trim();
+    if(!raw){ FOLDER=''; el.classList.remove('ok','bad'); hintEl.textContent=''; hintEl.className='folder-hint'; updateDlState(); return; }
+    if(!apiReady){ updateDlState(); return; }
+    try{
+      const res = await api().resolve_folder(raw);
+      FOLDER = res.ok ? res.path : '';
+      el.classList.toggle('ok', res.ok);
+      el.classList.toggle('bad', !res.ok);
+      // If we resolved an smb:// URL to a real mounted path, show it in the box.
+      if(res.ok && res.path && res.path!==raw){ el.value = res.path; }
+      hintEl.textContent = res.hint || '';
+      hintEl.className = 'folder-hint' + (res.ok ? ' ok' : (res.hint ? ' bad' : ''));
+    }catch(e){}
+    updateDlState();
+  }
+  // debounce typing on the folder field (script runs at end of <body>, so the
+  // element already exists)
+  (function(){
+    const el=document.getElementById('folderPath');
+    if(el) el.addEventListener('input',()=>{
+      clearTimeout(_folderTimer);
+      _folderTimer=setTimeout(()=>setFolder(el.value), 350);
+    });
+  })();
 
   function startDownload(){
     if(!apiReady || SELECTED.size===0 || !FOLDER) return;
@@ -1812,6 +1893,90 @@ class Api:
         if dirs:
             return dirs[0] if isinstance(dirs, (list, tuple)) else dirs
         return ""
+
+    def check_folder(self, path):
+        """True if `path` is an existing, writable directory. Works for mounted
+        SMB/NAS shares since the OS presents them as ordinary paths."""
+        try:
+            path = (path or "").strip()
+            return bool(path) and os.path.isdir(path) and os.access(path, os.W_OK)
+        except Exception:
+            return False
+
+    def resolve_folder(self, raw):
+        """
+        Turn whatever the user typed into a usable local path.
+
+        - A normal path is validated as-is.
+        - An smb:// URL can't be written to directly (it's a network address,
+          not a filesystem path). We try to find where the OS has already
+          mounted it (GVFS, or a CIFS mount), and if we can't, we return a hint
+          telling the user how to mount it and what to paste instead.
+
+        Returns {path, ok, hint}. `path` is the resolved local path to actually
+        use (may equal the input); `ok` is whether it's writable now.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return {"path": "", "ok": False, "hint": ""}
+
+        # Plain filesystem path → validate directly.
+        if not raw.lower().startswith("smb://"):
+            ok = self.check_folder(raw)
+            hint = "" if ok else "Folder not found or not writable."
+            return {"path": raw, "ok": ok, "hint": hint}
+
+        # smb:// URL → parse out host + share, then look for a mount.
+        import urllib.parse, getpass
+        u = urllib.parse.urlparse(raw)
+        host = u.hostname or ""
+        parts = [p for p in (u.path or "").split("/") if p]
+        share = parts[0] if parts else ""
+        subpath = "/".join(parts[1:]) if len(parts) > 1 else ""
+        if not host or not share:
+            return {"path": raw, "ok": False,
+                    "hint": "Couldn't read that smb:// address. Expected smb://host/Share/…"}
+
+        candidates = []
+        # 1) GVFS (what a file-manager "Connect to Server" produces)
+        try:
+            uid = os.getuid()
+            gvfs = f"/run/user/{uid}/gvfs"
+            if os.path.isdir(gvfs):
+                for entry in os.listdir(gvfs):
+                    # entry looks like: smb-share:server=192.168.2.116,share=anime
+                    el = entry.lower()
+                    if "smb-share:" in el and f"server={host.lower()}" in el \
+                       and f"share={share.lower()}" in el:
+                        candidates.append(os.path.join(gvfs, entry))
+        except Exception:
+            pass
+        # 2) Common CIFS mount points
+        for base in ("/mnt", "/media", os.path.expanduser("~/mnt")):
+            try:
+                if os.path.isdir(base):
+                    for entry in os.listdir(base):
+                        if entry.lower() == share.lower():
+                            candidates.append(os.path.join(base, entry))
+            except Exception:
+                pass
+
+        for c in candidates:
+            full = os.path.join(c, subpath) if subpath else c
+            if self.check_folder(full):
+                return {"path": full, "ok": True,
+                        "hint": f"Found mounted share → {full}"}
+
+        # Not mounted anywhere we can see → guide the user.
+        user = getpass.getuser()
+        hint = ("That SMB share isn't mounted yet. Either open it once in your file "
+                f"manager (Connect to Server → {raw}), then paste the path that "
+                f"appears under /run/user/{os.getuid()}/gvfs/ — or mount it properly:\n"
+                f"  sudo mkdir -p /mnt/{share}\n"
+                f"  sudo mount -t cifs //{host}/{share} /mnt/{share} "
+                f"-o username={user},uid=$(id -u),gid=$(id -g)\n"
+                f"…then paste  /mnt/{share}")
+        return {"path": raw, "ok": False, "hint": hint}
 
     def start_download(self, payload):
         """

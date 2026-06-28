@@ -57,7 +57,11 @@ python3 -m pip install patchright pywebview
 python3 -m patchright install chromium
 ```
 
-### Windows / macOS
+### Windows — prebuilt .exe (easiest)
+
+Grab `AnimePaheDownloader.exe` from the [Releases page](../../releases) and run it. On first launch it downloads its Chromium browser automatically (one-time), then opens. No Python install needed.
+
+### Windows / macOS — from source
 
 ```bash
 pip install -r requirements.txt
