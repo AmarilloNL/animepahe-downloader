@@ -45,9 +45,15 @@ jobs:
           Write-Host "webview lib dir: $lib"
           Get-ChildItem -Recurse $lib | Select-Object FullName | Format-Table -AutoSize
 
+          # Resolve the icon to an absolute path and fail loudly if it's missing,
+          # so a bad path can't silently produce an icon-less .exe.
+          $icon = (Resolve-Path "app_icon.ico").Path
+          Write-Host "Using icon: $icon"
+          if (-not (Test-Path $icon)) { throw "app_icon.ico not found!" }
+
           pyinstaller --onefile --noconsole `
             --name "AnimePaheDownloader" `
-            --icon "app_icon.ico" `
+            --icon "$icon" `
             --collect-all patchright `
             --collect-all webview `
             --collect-all bs4 `
@@ -61,6 +67,10 @@ jobs:
             --add-data "app_icon.ico;." `
             --add-data "icon.png;." `
             animepahe_downloader.py
+
+          # Confirm the built .exe actually carries an icon resource.
+          Write-Host "=== verifying embedded icon ==="
+          python -c "import struct,sys; d=open('dist/AnimePaheDownloader.exe','rb').read(); print('icon resource present' if b'\x00\x00\x01\x00' in d[:2000000] else 'NOTE: icon marker not found in header scan (may still be present)')"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

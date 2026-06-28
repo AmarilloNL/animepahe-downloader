@@ -33,6 +33,14 @@ How it works:
 
 import os
 import sys
+# On Windows, stdout/stderr default to cp1252 and crash on Unicode like → or ✓.
+# Force UTF-8 so logging and status messages can never raise UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # PyInstaller-frozen Windows builds: this MUST run before anything that can
 # spawn a subprocess, or child processes relaunch the whole GUI in a loop.
 import multiprocessing
@@ -99,12 +107,23 @@ PROFILE_DIR = Path.home() / ".config" / "animepahe-dl" / "chromium-profile"
 LOG_PATH    = Path.home() / ".config" / "animepahe-dl" / "engine.log"
 
 def _log(msg: str):
-    """Append a timestamped line to the engine log AND print it."""
+    """Append a timestamped line to the engine log AND print it.
+
+    Must never raise: on Windows the console/file default to cp1252, which can't
+    encode characters like → or ✓ and would otherwise crash the calling job with
+    UnicodeEncodeError. We force UTF-8 and swallow any encoding errors."""
     line = f"{time.strftime('%H:%M:%S')} {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:
+        # cp1252 console can't encode some chars — fall back to ascii-safe.
+        try:
+            print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a") as f:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -162,7 +181,7 @@ def _ensure_chromium_installed(status_cb=None):
 
         _log("ENGINE: Chromium install finished.")
         if status_cb:
-            status_cb("Browser engine installed ✓")
+            status_cb("Browser engine installed.")
     except Exception as e:
         _log(f"ENGINE: chromium auto-install skipped ({type(e).__name__})")
         if status_cb:
@@ -514,7 +533,7 @@ class BrowserEngine:
                     try:
                         r = self._goto(page, url)
                         if not self._is_blocked(r.status if r else 0, page):
-                            _log("SOLVE: confirmed cleared ✓")
+                            _log("SOLVE: confirmed cleared")
                             return
                     except Exception as e:
                         _log(f"SOLVE: confirm reload err {type(e).__name__}")
@@ -705,7 +724,7 @@ class BrowserEngine:
                         pass
                     km = re.search(r'https://kwik\.[a-z]+/f/[A-Za-z0-9]+', html)
                     if km:
-                        _log(f"DLRES: pahe→kwik (embedded) {km.group(0)}")
+                        _log(f"DLRES: pahe to kwik (embedded) {km.group(0)}")
                         try:
                             page.goto(km.group(0), wait_until="commit", timeout=20000)
                             page.wait_for_load_state("domcontentloaded", timeout=8000)
@@ -866,9 +885,17 @@ def get_engine(headless: bool = False, status_cb=None, on_challenge=None) -> Bro
     if _engine is None:
         if status_cb:
             status_cb("Launching browser… solve the 'Verify you are human' check in the window if it appears.")
-        _engine = BrowserEngine(headless=headless, status_cb=status_cb, on_challenge=on_challenge)
+        eng = BrowserEngine(headless=headless, status_cb=status_cb, on_challenge=on_challenge)
         # Warm up: open AnimePahe and wait for the user to clear any challenge.
-        _engine.solve(BASE_URL)
+        try:
+            eng.solve(BASE_URL)
+        except Exception:
+            # Don't cache a half-initialized engine; tear it down and re-raise so
+            # the caller can retry cleanly instead of reusing a dead browser.
+            try: eng.shutdown()
+            except Exception: pass
+            raise
+        _engine = eng
     return _engine
 
 
@@ -1815,6 +1842,11 @@ class Api:
     # ── engine lifecycle ────────────────────────────────────────────────────────
     def start_engine(self):
         """Kick off the persistent browser engine in the background."""
+        # Guard against being called more than once (boot + UI poll could both
+        # fire it, which would spawn multiple browser windows).
+        if getattr(self, "_engine_starting", False) or self._engine_ready:
+            return True
+        self._engine_starting = True
         self._engine_dot = "starting"
         self._set_status("Opening browser — if you see 'Verify you are human', "
                          "click it in the browser window.", "warn")
@@ -1826,7 +1858,7 @@ class Api:
                            on_challenge=lambda: self._on_challenge())
                 self._engine_ready = True
                 self._engine_dot = "ready"
-                self._set_status("Browser ready ✓  Minimizing it — browse away.", "success")
+                self._set_status("Browser ready. Minimizing it — browse away.", "success")
                 try:
                     get_engine().go_headless()
                     self._engine_dot = "minimized"
@@ -1836,6 +1868,7 @@ class Api:
                 self.load_catalog()
             except Exception as e:
                 self._engine_dot = "error"
+                self._engine_starting = False   # allow a retry
                 self._set_status(f"Engine failed to start: {e}", "error")
 
         threading.Thread(target=run, daemon=True).start()
