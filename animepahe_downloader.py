@@ -131,6 +131,38 @@ def _log(msg: str):
 _engine: "BrowserEngine | None" = None
 
 
+def _cleanup_playwright_artifacts():
+    """
+    Playwright/patchright writes per-session scratch files named
+    'playwright-artifacts-*' into the system temp dir. Normally they're removed
+    when the browser closes cleanly, but a crash or hard exit can orphan them —
+    and they can grow to many GB over repeated launches. Sweep away any stale
+    ones at startup so they never accumulate.
+    """
+    import glob, shutil, tempfile, time as _t
+    try:
+        tmp = tempfile.gettempdir()
+        now = _t.time()
+        removed = 0
+        for d in glob.glob(os.path.join(tmp, "playwright-artifacts-*")):
+            try:
+                # Only remove ones not touched in the last 5 minutes, so we never
+                # delete the artifacts of a browser that's actively running.
+                if now - os.path.getmtime(d) < 300:
+                    continue
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                else:
+                    os.remove(d)
+                removed += 1
+            except Exception:
+                pass
+        if removed:
+            _log(f"CLEANUP: removed {removed} stale playwright-artifacts dir(s)")
+    except Exception as e:
+        _log(f"CLEANUP: artifact sweep skipped ({type(e).__name__})")
+
+
 def _chromium_present():
     import glob
     if os.name == "nt":
@@ -240,6 +272,7 @@ class BrowserEngine:
                     pass
 
             _log("ENGINE: starting sync_playwright()")
+            _cleanup_playwright_artifacts()
             _ensure_chromium_installed(status_cb=self._status_cb)
             self._pw = sync_playwright().start()
             _log("ENGINE: sync_playwright started")
@@ -273,6 +306,8 @@ class BrowserEngine:
             self._pw.stop()
         except Exception:
             pass
+        # Final sweep so this session leaves no scratch files behind.
+        _cleanup_playwright_artifacts()
 
     def _call(self, fn, *args, **kwargs):
         """Run fn on the engine thread, block for its result."""
@@ -795,6 +830,18 @@ class BrowserEngine:
                     page.evaluate("(document.querySelector('form')||{submit(){}}).submit()")
                 direct = dl.value.url
                 _log(f"DLRES: got download url {direct[:80]}")
+                # IMPORTANT: we only want the URL — we download the file ourselves
+                # via urllib. Playwright otherwise stages a full copy of the video
+                # (~150MB each) in its temp artifacts dir and keeps it, which fills
+                # the disk over a long batch. Cancel + delete its staged copy now.
+                try:
+                    dl.value.cancel()
+                except Exception:
+                    pass
+                try:
+                    dl.value.delete()
+                except Exception:
+                    pass
                 self._reassert_minimized()
             except Exception:
                 pass
@@ -2249,6 +2296,10 @@ class Api:
                     self._set_progress(100, "Complete")
             finally:
                 self._downloading = False
+                # Reclaim disk space after the batch: sweep orphaned browser
+                # scratch files. The sweep skips anything modified in the last
+                # few minutes, so the live browser's own files are never touched.
+                _cleanup_playwright_artifacts()
 
         threading.Thread(target=run, daemon=True).start()
         return True
