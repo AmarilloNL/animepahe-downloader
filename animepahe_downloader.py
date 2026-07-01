@@ -238,6 +238,8 @@ class BrowserEngine:
         self._on_challenge = on_challenge   # called when a visible re-solve is needed
         self._current_headless = False      # we always start visible
         self._minimized = False             # window minimized state
+        self._pending_dest = None           # dest path for browser save_as download
+        self._pending_progress = None       # progress callback for the save
         self._jobs:    "queue.Queue" = queue.Queue()
         self._ready    = threading.Event()
         self._err      = None
@@ -644,32 +646,43 @@ class BrowserEngine:
 
     def _fetch_image(self, url: str) -> bytes | None:
         """
-        Fetch a poster/snapshot through the browser's request API. The image host
-        (i.animepahe.pw) sits behind the same Cloudflare protection as the rest of
-        the site, so a bare urllib request gets a 403. The engine's persistent
-        context already holds the clearance cookies; context.request.get() reuses
-        them and isn't subject to the page-level CORP restriction (that only
-        applies to rendering in a document, not to the request API).
+        Fetch a poster/snapshot. The image host (i.animepahe.pw) rejects every
+        API/fetch route with 403 (bare, +referer, +cookies all fail) and CORP
+        blocks in-page fetch. The ONLY thing it accepts is a real browser
+        navigation to the image URL. So we open a throwaway tab, navigate to the
+        image, and read the raw response bytes (which ARE the image). Verified by
+        probe: page.goto(image) -> 200, resp.body() -> image bytes.
         Returns raw image bytes, or None.
         """
         if not url:
             return None
+        tab = None
         try:
-            page = self._main_page()
-            # Make sure we're on a cleared animepahe origin so cookies are present.
-            if not (page.url or "").startswith(BASE_URL):
-                self._goto(page, BASE_URL)
-            resp = page.context.request.get(url, headers={
-                "Referer": BASE_URL + "/",
-                "Accept": "image/webp,image/*,*/*",
-            }, timeout=15000)
-            if not resp.ok:
-                _log(f"IMG: fetch HTTP {resp.status} {url[:60]}")
+            # Make sure the main page has cleared Cloudflare so the session is warm.
+            main = self._main_page()
+            if not (main.url or "").startswith(BASE_URL):
+                self._goto(main, BASE_URL)
+            tab = self._ctx.new_page()
+            resp = tab.goto(url, wait_until="commit", timeout=15000)
+            if not resp or not resp.ok:
+                _log(f"IMG: goto HTTP {resp.status if resp else '?'} {url[:55]}")
                 return None
-            return resp.body()
+            data = resp.body()
+            if not data or len(data) < 64:
+                _log(f"IMG: empty body {url[:55]}")
+                return None
+            return data
         except Exception as e:
-            _log(f"IMG: fetch failed {type(e).__name__} {url[:60]}")
+            _log(f"IMG: fetch failed {type(e).__name__} {url[:55]}")
             return None
+        finally:
+            if tab is not None:
+                try: tab.close()
+                except Exception: pass
+            # Opening/closing a tab can re-raise the window; keep it hidden.
+            if self._minimized:
+                try: self._reassert_minimized()
+                except Exception: pass
 
     def _handle_block(self):
         """Cloudflare is blocking us. Restore the window, signal the GUI, wait
@@ -822,27 +835,44 @@ class BrowserEngine:
             except Exception:
                 pass
 
-            # The MP4 may be revealed by submitting the form. Capture whichever
-            # of these fires: a download event, a navigation, or a popup. Use a
-            # generous timeout since Kwik can respond slowly when throttling.
+            # Submit the form to trigger the download. The vault CDN now rejects
+            # plain urllib/API requests with 403 (verified by probe) — the ONLY
+            # thing it accepts is a real browser download. So we let Playwright
+            # download it and save_as() straight to the destination. That also
+            # means no leftover copy in temp (fixes the disk-fill problem).
             try:
                 with page.expect_download(timeout=25000) as dl:
                     page.evaluate("(document.querySelector('form')||{submit(){}}).submit()")
-                direct = dl.value.url
+                download = dl.value
+                direct = download.url
                 _log(f"DLRES: got download url {direct[:80]}")
-                # IMPORTANT: we only want the URL — we download the file ourselves
-                # via urllib. Playwright otherwise stages a full copy of the video
-                # (~150MB each) in its temp artifacts dir and keeps it, which fills
-                # the disk over a long batch. Cancel + delete its staged copy now.
-                try:
-                    dl.value.cancel()
-                except Exception:
-                    pass
-                try:
-                    dl.value.delete()
-                except Exception:
-                    pass
                 self._reassert_minimized()
+
+                if self._pending_dest:
+                    # Save directly to the destination via the browser download.
+                    dest_path = self._pending_dest
+                    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+                    _log(f"DLRES: saving via browser to {dest_path}")
+                    try:
+                        # Report indeterminate progress; Playwright save_as is
+                        # atomic (no per-byte callback), so we show a spinner-ish
+                        # state and jump to 100% when it completes.
+                        if self._pending_progress:
+                            self._pending_progress(0.05)
+                        download.save_as(dest_path)
+                        if self._pending_progress:
+                            self._pending_progress(1.0)
+                        size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+                        _log(f"DLRES: browser download complete ({size} bytes)")
+                        # Clean up Playwright's temp copy now that it's saved.
+                        try: download.delete()
+                        except Exception: pass
+                        return ("SAVED", {"path": dest_path, "size": size})
+                    except Exception as e:
+                        _log(f"DLRES: save_as failed {type(e).__name__}: {str(e)[:80]}")
+                        try: download.delete()
+                        except Exception: pass
+                        return None
             except Exception:
                 pass
 
@@ -861,8 +891,24 @@ class BrowserEngine:
                         direct = pg.url
                         break
 
+            # Fallback path (rare): return the URL for the old urllib downloader.
             if direct and ".mp4" in direct:
-                return direct, {"Referer": origin + "/"}
+                cookie_hdr = ""
+                try:
+                    host = urlparse(direct).hostname or ""
+                    parts = []
+                    for c in self._ctx.cookies():
+                        dom = (c.get("domain") or "").lstrip(".")
+                        if dom and (dom in host or host.endswith(dom)
+                                    or "uwucdn" in dom or "kwik" in dom):
+                            parts.append(f"{c['name']}={c['value']}")
+                    cookie_hdr = "; ".join(parts)
+                except Exception:
+                    pass
+                hdrs = {"Referer": origin + "/", "User-Agent": HEADERS["User-Agent"]}
+                if cookie_hdr:
+                    hdrs["Cookie"] = cookie_hdr
+                return direct, hdrs
             _log("DLRES: no mp4 found")
             return None
         finally:
@@ -917,6 +963,22 @@ class BrowserEngine:
     def api_fetch(self, url):             return self._call(self._api_fetch, url)
     def fetch_image(self, url):           return self._call(self._fetch_image, url)
     def resolve_download(self, url):      return self._call(self._resolve_download, url)
+
+    def _resolve_and_save(self, url, dest_path, progress_cb, stop_event):
+        """Resolve the link AND download the MP4 via the browser (save_as),
+        which is the only method the CDN accepts now. Runs on the engine thread
+        so it shares the cleared browser session."""
+        self._pending_dest = dest_path
+        self._pending_progress = progress_cb
+        try:
+            return self._resolve_download(url)
+        finally:
+            self._pending_dest = None
+            self._pending_progress = None
+
+    def resolve_and_save(self, url, dest_path, progress_cb=None, stop_event=None):
+        return self._call(self._resolve_and_save, url, dest_path, progress_cb, stop_event)
+
     def download(self, url, dest, hdrs, progress_cb=None, stop_event=None):
         return self._call(self._download, url, dest, hdrs, progress_cb, stop_event)
     def go_headless(self):                return self._call(self._go_headless)
@@ -976,10 +1038,12 @@ def stream_download(url: str, dest_path: str, extra_headers: dict,
         have = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
 
         headers = {
-            "User-Agent": HEADERS["User-Agent"],
+            "User-Agent": extra_headers.get("User-Agent", HEADERS["User-Agent"]),
             "Referer": referer,
             "Accept": "*/*",
         }
+        if extra_headers.get("Cookie"):
+            headers["Cookie"] = extra_headers["Cookie"]
         if have:
             headers["Range"] = f"bytes={have}-"
             _log(f"DL: resuming from byte {have} (attempt {attempt})")
@@ -1280,6 +1344,17 @@ def resolve_download(pahe_or_kwik_url: str) -> tuple[str, dict] | None:
     Returns (mp4_url, {headers}) or None.
     """
     return get_engine().resolve_download(pahe_or_kwik_url)
+
+
+def resolve_and_save(pahe_or_kwik_url: str, dest_path: str,
+                     progress_cb=None, stop_event=None):
+    """
+    Resolve the link and download the MP4 straight to dest_path via the browser
+    (the CDN rejects urllib with 403). Returns ("SAVED", {path,size}) on success,
+    a (url, headers) tuple if only resolving worked, or None.
+    """
+    return get_engine().resolve_and_save(pahe_or_kwik_url, dest_path,
+                                         progress_cb, stop_event)
 
 
 
@@ -2218,28 +2293,9 @@ class Api:
                             self._set_status(f"Ep {ep_num}: No download links — skipping.", "error")
                             idx += 1; continue
                         chosen = pick_download_option(options, quality, audio)
-                        result = resolve_download(chosen["url"])
-                        if not result:
-                            self._set_status(f"Ep {ep_num}: link slow, retrying…", "warn")
-                            options2, _ = get_download_options(item["anime_id"], item["session"])
-                            if options2:
-                                chosen2 = pick_download_option(options2, quality, audio)
-                                result = resolve_download(chosen2["url"])
-                                if result: chosen = chosen2
-                        if not result:
-                            res_strikes += 1
-                            if res_strikes <= 3:
-                                wait_s = min(120, 30 * res_strikes)
-                                for r in range(wait_s, 0, -1):
-                                    if self._stop_event.is_set(): break
-                                    self._set_status(f"Links throttled — waiting {r}s before retrying Ep {ep_num}…", "warn")
-                                    time.sleep(1)
-                                continue
-                            self._set_status(f"Ep {ep_num}: Could not resolve after retries — skipping.", "error")
-                            res_strikes = 0; idx += 1; continue
-                        res_strikes = 0
-                        direct_url, extra_hdrs = result
 
+                        # Work out the destination path up-front (we need it to
+                        # save the browser download straight to disk).
                         anime_title = batch_title or item.get("title") or scraped_title
                         safe_title = re.sub(r'[\\/:*?"<>|]', "", anime_title).strip() or "Unknown"
                         ep_int = int(re.sub(r"\D", "", str(ep_num)) or 0)
@@ -2253,16 +2309,45 @@ class Api:
                             fname = f"{safe_title} - Ep{str(ep_num).zfill(3)} [{chosen['quality']}p].mp4"
                             dest_path = os.path.join(dest, fname)
 
+                        # save_as gives no per-byte progress, so we drive the bar
+                        # by batch position: show it partway while this episode
+                        # downloads, then step it to the next slot when done.
+                        def file_prog(frac, ep_done=idx):
+                            # frac is 0.05 at start, 1.0 at finish → nudge the bar
+                            # a little within this episode's slot for feedback.
+                            overall = (ep_done + min(frac, 0.9)) / total * 100
+                            self._set_progress(overall, f"Ep {ep_num} of {total}")
+
                         self._set_status(f"[{idx+1}/{total}] Downloading Ep {ep_num}…", "info")
 
-                        def file_prog(frac, ep_done=idx):
-                            overall = (ep_done + frac) / total * 100
-                            self._set_progress(overall, f"Ep {ep_num} · {int(frac*100)}%")
-
-                        ok = pw_download(direct_url, dest_path, extra_hdrs,
-                                         progress_cb=file_prog, stop_event=self._stop_event)
-                        if not ok:
-                            break
+                        # Resolve AND download via the browser (the CDN rejects
+                        # urllib with 403; only a real browser download works).
+                        result = resolve_and_save(chosen["url"], dest_path,
+                                                  progress_cb=file_prog,
+                                                  stop_event=self._stop_event)
+                        if not (result and isinstance(result, tuple) and result[0] == "SAVED"):
+                            # Retry once with a fresh link if the browser download
+                            # didn't complete.
+                            self._set_status(f"Ep {ep_num}: link slow, retrying…", "warn")
+                            options2, _ = get_download_options(item["anime_id"], item["session"])
+                            if options2:
+                                chosen2 = pick_download_option(options2, quality, audio)
+                                result = resolve_and_save(chosen2["url"], dest_path,
+                                                          progress_cb=file_prog,
+                                                          stop_event=self._stop_event)
+                        if not (result and isinstance(result, tuple) and result[0] == "SAVED"):
+                            res_strikes += 1
+                            if res_strikes <= 3:
+                                wait_s = min(120, 30 * res_strikes)
+                                for r in range(wait_s, 0, -1):
+                                    if self._stop_event.is_set(): break
+                                    self._set_status(f"Links throttled — waiting {r}s before retrying Ep {ep_num}…", "warn")
+                                    time.sleep(1)
+                                continue
+                            self._set_status(f"Ep {ep_num}: Could not download after retries — skipping.", "error")
+                            res_strikes = 0; idx += 1; continue
+                        res_strikes = 0
+                        self._set_progress((idx + 1) / total * 100, f"Ep {ep_num} done")
                         rl_strikes = ctx_strikes = 0
                         idx += 1
                     except RateLimited:
