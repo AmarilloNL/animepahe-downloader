@@ -442,11 +442,55 @@ class BrowserEngine:
         self._launch_ctx(self._current_headless)
         _log("MAINPAGE: relaunched context")
 
+    def _win_hide_browser(self):
+        """
+        On Windows the CDP 'minimized' state is unreliable (the window keeps
+        popping back on each navigation, causing a visible flash). Use the Win32
+        API to truly minimize the Chromium window by its handle, which sticks.
+        Returns True if it hid a window.
+        """
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            SW_MINIMIZE = 6
+            SW_HIDE = 0
+            # Find Chromium's top-level window(s). Patchright/Chrome windows have
+            # class name 'Chrome_WidgetWin_1'. We minimize all matching windows
+            # owned by our browser (there's normally just one).
+            hidden = [False]
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _enum(hwnd, lparam):
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, buf, 256)
+                if buf.value == "Chrome_WidgetWin_1" and user32.IsWindowVisible(hwnd):
+                    # Only minimize real browser windows (with a title).
+                    tlen = user32.GetWindowTextLengthW(hwnd)
+                    if tlen > 0:
+                        user32.ShowWindow(hwnd, SW_MINIMIZE)
+                        hidden[0] = True
+                return True
+
+            user32.EnumWindows(_enum, 0)
+            return hidden[0]
+        except Exception as e:
+            _log(f"WINDOW: win32 hide failed {type(e).__name__}")
+            return False
+
     def _window_state(self, state: str):
         """Set the browser window state via CDP: 'minimized' or 'normal'.
         Keeps the SAME browser alive (no relaunch), so Cloudflare clearance
-        is never lost. If 'minimized' is rejected (some Windows Chromium builds
-        refuse it), fall back to moving the window off-screen."""
+        is never lost. On Windows, prefer the native Win32 minimize (the CDP
+        one is unreliable and flashes); fall back to off-screen elsewhere."""
+        # On Windows, use the native minimize which actually sticks.
+        if state == "minimized" and os.name == "nt":
+            if self._win_hide_browser():
+                _log("WINDOW: minimized (win32)")
+                return True
+            # else fall through to CDP attempt below
         try:
             page = self._main_page()
             session = self._ctx.new_cdp_session(page)
