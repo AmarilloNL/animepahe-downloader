@@ -797,12 +797,17 @@ class BrowserEngine:
             self._go_headless()
 
     def _reassert_minimized(self):
-        """If the window is supposed to be minimized, push it back. New tabs and
-        navigations tend to raise/focus the window on Linux; this snaps it back
+        """If the window is supposed to be minimized/hidden, push it back. New
+        tabs and navigations tend to raise/focus the window; this snaps it back
         so resolve tabs don't steal focus during background downloads."""
         if self._minimized:
             try:
-                self._window_state("minimized")
+                if os.name == "nt":
+                    # Direct SW_HIDE is faster than the CDP round-trip and keeps
+                    # the window from lingering visibly.
+                    self._win_hide_browser()
+                else:
+                    self._window_state("minimized")
             except Exception:
                 pass
 
@@ -814,6 +819,9 @@ class BrowserEngine:
         check genuinely needs solving.
         """
         page = self._ctx.new_page()
+        # Opening a tab un-hides the window on Windows; re-hide immediately.
+        if self._minimized and os.name == "nt":
+            self._win_hide_browser()
         self._reassert_minimized()   # new tab tried to raise the window — push back
         try:
             _log(f"DLRES: opening {start_url}")
@@ -926,10 +934,17 @@ class BrowserEngine:
             try:
                 with page.expect_download(timeout=25000) as dl:
                     page.evaluate("(document.querySelector('form')||{submit(){}}).submit()")
+                    # The submit can raise the window right as the download
+                    # starts; hide it again immediately (before we block on
+                    # save_as) so it doesn't flash during the download.
+                    if self._minimized and os.name == "nt":
+                        self._win_hide_browser()
                 download = dl.value
                 direct = download.url
                 _log(f"DLRES: got download url {direct[:80]}")
                 self._reassert_minimized()
+                if self._minimized and os.name == "nt":
+                    self._win_hide_browser()
 
                 if self._pending_dest:
                     # Save directly to the destination via the browser download.
