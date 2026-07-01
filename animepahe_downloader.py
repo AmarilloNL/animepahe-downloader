@@ -444,9 +444,10 @@ class BrowserEngine:
 
     def _win_hide_browser(self):
         """
-        On Windows the CDP 'minimized' state is unreliable (the window keeps
-        popping back on each navigation, causing a visible flash). Use the Win32
-        API to truly minimize the Chromium window by its handle, which sticks.
+        On Windows the CDP 'minimized' state is unreliable — the window pops back
+        on every new tab/navigation, causing a visible flash. We use the Win32
+        API to HIDE the Chromium window entirely (SW_HIDE). A hidden window can't
+        flash when tabs open behind it. The "Show Browser" button un-hides it.
         Returns True if it hid a window.
         """
         if os.name != "nt":
@@ -455,22 +456,19 @@ class BrowserEngine:
             import ctypes
             from ctypes import wintypes
             user32 = ctypes.windll.user32
-            SW_MINIMIZE = 6
             SW_HIDE = 0
-            # Find Chromium's top-level window(s). Patchright/Chrome windows have
-            # class name 'Chrome_WidgetWin_1'. We minimize all matching windows
-            # owned by our browser (there's normally just one).
             hidden = [False]
+            self._win_hwnds = []
 
             @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
             def _enum(hwnd, lparam):
                 buf = ctypes.create_unicode_buffer(256)
                 user32.GetClassNameW(hwnd, buf, 256)
                 if buf.value == "Chrome_WidgetWin_1" and user32.IsWindowVisible(hwnd):
-                    # Only minimize real browser windows (with a title).
                     tlen = user32.GetWindowTextLengthW(hwnd)
                     if tlen > 0:
-                        user32.ShowWindow(hwnd, SW_MINIMIZE)
+                        user32.ShowWindow(hwnd, SW_HIDE)
+                        self._win_hwnds.append(hwnd)
                         hidden[0] = True
                 return True
 
@@ -478,6 +476,39 @@ class BrowserEngine:
             return hidden[0]
         except Exception as e:
             _log(f"WINDOW: win32 hide failed {type(e).__name__}")
+            return False
+
+    def _win_show_browser(self):
+        """Un-hide the Chromium window(s) we hid with SW_HIDE (for 'Show Browser'
+        and for Cloudflare re-solves)."""
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            SW_SHOW = 5
+            SW_RESTORE = 9
+            shown = False
+            for hwnd in getattr(self, "_win_hwnds", []):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.ShowWindow(hwnd, SW_SHOW)
+                user32.SetForegroundWindow(hwnd)
+                shown = True
+            # Also scan for any hidden Chrome windows we may have missed.
+            from ctypes import wintypes
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _enum(hwnd, lparam):
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, buf, 256)
+                if buf.value == "Chrome_WidgetWin_1" and not user32.IsWindowVisible(hwnd):
+                    if user32.GetWindowTextLengthW(hwnd) > 0:
+                        user32.ShowWindow(hwnd, SW_RESTORE)
+                        user32.ShowWindow(hwnd, SW_SHOW)
+                return True
+            user32.EnumWindows(_enum, 0)
+            return shown
+        except Exception as e:
+            _log(f"WINDOW: win32 show failed {type(e).__name__}")
             return False
 
     def _window_state(self, state: str):
@@ -535,6 +566,9 @@ class BrowserEngine:
 
     def _go_visible(self):
         """Restore + focus the browser window so the user can re-solve."""
+        # On Windows the window is SW_HIDE-hidden; un-hide it via Win32 first.
+        if os.name == "nt":
+            self._win_show_browser()
         # Explicitly bring it back on-screen (in case we hid it off-screen).
         try:
             page = self._main_page()
@@ -707,6 +741,11 @@ class BrowserEngine:
             if not (main.url or "").startswith(BASE_URL):
                 self._goto(main, BASE_URL)
             tab = self._ctx.new_page()
+            # Opening a tab un-minimizes the window on Windows. Re-hide it
+            # immediately (before navigation) to keep the flash as short as
+            # possible.
+            if self._minimized:
+                self._win_hide_browser()
             resp = tab.goto(url, wait_until="commit", timeout=15000)
             if not resp or not resp.ok:
                 _log(f"IMG: goto HTTP {resp.status if resp else '?'} {url[:55]}")
