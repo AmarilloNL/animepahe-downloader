@@ -427,9 +427,14 @@ class BrowserEngine:
         """
         On Windows the CDP 'minimized' state is unreliable — the window pops back
         on every new tab/navigation, causing a visible flash. We use the Win32
-        API to HIDE the Chromium window entirely (SW_HIDE). A hidden window can't
-        flash when tabs open behind it. The "Show Browser" button un-hides it.
-        Returns True if it hid a window.
+        API to HIDE the Chromium window (SW_HIDE) AND park it far off-screen.
+
+        The off-screen move is the important part: when Chromium opens a new tab
+        (poster/resolve fetches) it briefly SHOWS its window before we can re-hide
+        it. If the window sits at its normal on-screen spot, that show is a visible
+        flash. Parked off-screen, the show happens where nobody can see it. The
+        "Show Browser" path repositions it back on-screen. Returns True if it hid
+        a window.
         """
         if os.name != "nt":
             return False
@@ -438,6 +443,8 @@ class BrowserEngine:
             from ctypes import wintypes
             user32 = ctypes.windll.user32
             SW_HIDE = 0
+            # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            SWP_OFFSCREEN = 0x0001 | 0x0004 | 0x0010
             hidden = [False]
             self._win_hwnds = []
 
@@ -448,6 +455,9 @@ class BrowserEngine:
                 if buf.value == "Chrome_WidgetWin_1" and user32.IsWindowVisible(hwnd):
                     tlen = user32.GetWindowTextLengthW(hwnd)
                     if tlen > 0:
+                        # Park off-screen first, THEN hide — so any later
+                        # Chromium-triggered show is off-screen (no flash).
+                        user32.SetWindowPos(hwnd, 0, -32000, -32000, 0, 0, SWP_OFFSCREEN)
                         user32.ShowWindow(hwnd, SW_HIDE)
                         self._win_hwnds.append(hwnd)
                         hidden[0] = True
@@ -469,8 +479,11 @@ class BrowserEngine:
             user32 = ctypes.windll.user32
             SW_SHOW = 5
             SW_RESTORE = 9
+            SWP_ONSCREEN = 0x0004 | 0x0010   # NOZORDER | NOACTIVATE (allow move+size)
             shown = False
             for hwnd in getattr(self, "_win_hwnds", []):
+                # We parked it off-screen when hiding — bring it back into view.
+                user32.SetWindowPos(hwnd, 0, 80, 80, 1100, 760, SWP_ONSCREEN)
                 user32.ShowWindow(hwnd, SW_RESTORE)
                 user32.ShowWindow(hwnd, SW_SHOW)
                 user32.SetForegroundWindow(hwnd)
@@ -483,6 +496,7 @@ class BrowserEngine:
                 user32.GetClassNameW(hwnd, buf, 256)
                 if buf.value == "Chrome_WidgetWin_1" and not user32.IsWindowVisible(hwnd):
                     if user32.GetWindowTextLengthW(hwnd) > 0:
+                        user32.SetWindowPos(hwnd, 0, 80, 80, 1100, 760, SWP_ONSCREEN)
                         user32.ShowWindow(hwnd, SW_RESTORE)
                         user32.ShowWindow(hwnd, SW_SHOW)
                 return True
