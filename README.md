@@ -14,8 +14,13 @@ A desktop app to search, browse, and batch-download anime episodes from AnimePah
 - **Search** — find anime by name, shown as a card grid with cover art
 - **Batch download** — select individual episodes, a range, or a whole season at once
 - **Quality and audio selection** — choose 1080p/720p/480p/360p and sub/dub when available
+- **Skip what you already have** — re-point the app at a series and it only fetches the missing episodes (matches any quality, so a 720p file already on disk won't be re-grabbed in 1080p)
+- **Remembers your setup** — quality, audio, naming, folder, and parallelism are restored on the next launch
+- **Live progress** — a real per-file percentage and MB counter, not just a batch position
+- **Optional parallel downloads** — pull 2–3 episodes at once for faster batches (off by default; higher values raise the risk of a Cloudflare/Kwik block)
+- **Self-test** — one button walks the whole pipeline (API → episodes → links → resolve) and tells you exactly which step broke when the site changes
 - **Background operation** — the browser minimizes and downloads run quietly while you do other things
-- **Jellyfin/Plex naming** — optional `Series/Series - S01E01` folder structure that media servers recognize automatically
+- **Jellyfin/Plex naming** — optional `Series/Series - S01E01` folder structure that media servers recognize automatically, with the season number auto-guessed from the title
 - **Resilient** — backs off and retries on rate limits, throttling, and transient failures, and resumes stalled downloads
 
 ## How it works
@@ -29,6 +34,23 @@ The download flow for each episode is:
 1. Scrape the play page for the real download links (`pahe.win` redirects, with quality/audio labels)
 2. Follow `pahe.win` → `kwik.cx` → the direct MP4 URL on the CDN
 3. Stream that MP4 straight to disk with the correct headers
+
+### Project layout
+
+The code is split into small modules so the parts that break when the site
+changes are easy to find:
+
+| File | Responsibility |
+|------|----------------|
+| `animepahe_downloader.py` | App entry point — the pywebview window and the JS↔Python API bridge (`class Api`) |
+| `pahe_engine.py` | The persistent stealth-Chromium session, network/stream layer, and settings/log paths |
+| `pahe_scrape.py` | Search/browse/episode parsing, file naming, and link resolving |
+| `pahe_ui.py` | The HTML/CSS/JS frontend (`INDEX_HTML`) |
+| `tests/` | Offline unit tests for the parsers and naming logic |
+
+Run it exactly as before — `python animepahe_downloader.py`. The extra modules
+are imported automatically, and PyInstaller bundles them into the same single
+`.exe`.
 
 ## Requirements
 
@@ -112,9 +134,23 @@ Point your media server's library at the parent folder and it will recognize the
 
 The app logs everything to `~/.config/animepahe-dl/engine.log` and to the terminal — check there first when something goes wrong.
 
+## Development
+
+The parsing and naming logic has offline unit tests (no browser or network
+needed — the engine and fetch layer are monkeypatched with canned responses):
+
+```bash
+pip install pytest
+python -m pytest tests/ -q
+```
+
+These are the fastest way to confirm a scraping change still produces the right
+data shapes. When AnimePahe/Kwik change their markup, update the parser in
+`pahe_scrape.py` and adjust the matching fixture in `tests/test_parsing.py`.
+
 ## Contributing
 
-Issues and pull requests are welcome. Because AnimePahe and Kwik change their page structure and bot protection periodically, the scraping/resolve logic occasionally needs updating — the detailed logs make it straightforward to see which step broke.
+Issues and pull requests are welcome. Because AnimePahe and Kwik change their page structure and bot protection periodically, the scraping/resolve logic occasionally needs updating — the detailed logs make it straightforward to see which step broke, and the **Self-test** button pinpoints the failing stage.
 
 ## License
 

@@ -62,6 +62,9 @@ jobs:
             --hidden-import clr `
             --hidden-import clr_loader `
             --hidden-import pythonnet `
+            --hidden-import pahe_engine `
+            --hidden-import pahe_scrape `
+            --hidden-import pahe_ui `
             --add-data "$lib;webview/lib" `
             --add-data "$lib;webview\lib" `
             --add-data "app_icon.ico;." `
