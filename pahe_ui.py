@@ -180,7 +180,43 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .ep-row.sel .ep-check svg{opacity:1}
   .ep-num{color:var(--cyan); font-weight:700; min-width:46px; font-size:12px}
   .ep-title{color:var(--sub); overflow:hidden; text-overflow:ellipsis;
-    white-space:nowrap}
+    white-space:nowrap; flex:1}
+  /* per-episode status chip (on disk / downloading / done / failed) */
+  .ep-tag{margin-left:auto; font-size:9px; font-weight:700; letter-spacing:.4px;
+    padding:2px 7px; border-radius:6px; text-transform:uppercase; flex:none;
+    display:none; border:1px solid transparent; white-space:nowrap}
+  .ep-tag.show{display:inline-block}
+  .ep-tag.t-disk,.ep-tag.t-skip{color:var(--muted); border-color:var(--border2)}
+  .ep-tag.t-active{color:var(--warn); border-color:#fcd34d55;
+    animation:pulse 1.4s infinite}
+  .ep-tag.t-done{color:var(--success); border-color:#34d39955}
+  .ep-tag.t-failed{color:var(--error); border-color:#fb718555}
+  .ep-row.on-disk .ep-title,.ep-row.dl-done .ep-title{color:var(--muted)}
+
+  .progtext{font-size:11px; color:var(--cyan); min-height:14px; font-weight:600;
+    letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+
+  /* batch summary + retry (shown under the progress bar during/after a run) */
+  .batchbar{display:none; align-items:center; gap:10px; font-size:11.5px;
+    color:var(--sub)}
+  .batchbar.show{display:flex}
+  .batchbar .bcount{color:var(--text); font-weight:600}
+  .batchbar .bfail{color:var(--error); font-weight:600}
+  .batchbar .bsize{color:var(--muted); margin-left:auto}
+  .btn-retry{border:1px solid #fb718566; background:var(--card); color:var(--error);
+    padding:5px 11px; border-radius:9px; font-size:11.5px; font-weight:600;
+    cursor:pointer; display:none}
+  .btn-retry.show{display:inline-block}
+  .btn-retry:hover{background:#fb71851a}
+
+  /* update-available chip in the top bar */
+  .update-chip{display:none; align-items:center; gap:6px; cursor:pointer;
+    font-size:11.5px; font-weight:600; color:#0a0a14; padding:7px 12px;
+    border-radius:11px; background:linear-gradient(135deg,var(--success),#22d3ee);
+    box-shadow:0 0 14px #34d39955; white-space:nowrap}
+  .update-chip.show{display:flex}
+  .ver{font-size:10px; color:var(--muted); font-weight:600; letter-spacing:.3px;
+    align-self:center; margin-left:2px}
 
   /* ── controls ───────────────────────────────────────── */
   .controls{border-top:1px solid var(--border); padding:12px 14px;
@@ -258,6 +294,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <!-- top bar -->
   <div class="topbar">
     <div class="logo"><span class="dot">◆</span>PAHE<span class="dl">DL</span></div>
+    <span class="ver" id="verLabel"></span>
     <div class="searchwrap">
       <div class="searchbox">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
@@ -268,6 +305,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="btn btn-ghost cyan" id="btnLatest" onclick="loadLatest()">Latest</button>
     </div>
     <div class="engine">
+      <div class="update-chip" id="updateChip" onclick="openRelease()">⬆ Update</div>
       <div class="dot" id="engineDot"><span class="led"></span><span id="engineTxt">starting…</span></div>
       <button class="btn btn-ghost cyan" onclick="runDiagnostics()">Self-test</button>
       <button class="btn btn-ghost" onclick="showBrowser()">Show Browser</button>
@@ -305,6 +343,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <span class="quick" onclick="applyRange()">Apply</span>
           <span class="quick" onclick="selectAll(true)">All</span>
           <span class="quick" onclick="selectAll(false)">None</span>
+          <span class="quick" onclick="selectMissing()" title="Select only episodes you don't already have">Missing</span>
         </div>
         <div class="ctl-row">
           <div class="seg"><label>Quality</label>
@@ -326,6 +365,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="folder-hint" id="folderHint"></div>
         <div class="prog"><div class="fill" id="progFill"></div></div>
+        <div class="progtext" id="progText"></div>
+        <div class="batchbar" id="batchBar">
+          <span id="batchSummary"></span>
+          <span class="bsize" id="batchSize"></span>
+          <button class="btn-retry" id="btnRetry" onclick="retryFailed()">Retry failed</button>
+        </div>
         <div class="dlbar">
           <button class="btn btn-dl" id="btnDl" onclick="startDownload()" disabled>Download</button>
           <button class="btn btn-stop" id="btnStop" onclick="stopDownload()" disabled>Stop</button>
@@ -525,15 +570,55 @@ INDEX_HTML = r"""<!DOCTYPE html>
     l.innerHTML='';
     EPISODES.forEach((ep,i)=>{
       const row=document.createElement('div');
-      row.className='ep-row'; row.dataset.i=i; row.onclick=()=>toggleEp(i);
+      row.className='ep-row'; row.dataset.i=i; row.dataset.ep=ep.episode;
+      row.onclick=()=>toggleEp(i);
       row.innerHTML =
         `<div class="ep-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg></div>`+
         `<div class="ep-num">EP ${ep.episode}</div>`+
-        `<div class="ep-title">${escapeHtml(ep.title||'—')}</div>`;
+        `<div class="ep-title">${escapeHtml(ep.title||'—')}</div>`+
+        `<span class="ep-tag"></span>`;
       l.appendChild(row);
     });
     updateSel(); updateDlState();
+    refreshDownloaded();   // grey out episodes already on disk
   };
+
+  // Mark episodes already present on disk (uses the current folder/season/naming).
+  async function refreshDownloaded(){
+    if(!apiReady || !EPISODES.length) return;
+    if(!FOLDER){ document.querySelectorAll('.ep-row').forEach(r=>{
+      r.classList.remove('on-disk'); const t=r.querySelector('.ep-tag');
+      if(t && t.classList.contains('t-disk')){ t.className='ep-tag'; t.textContent=''; }
+    }); return; }
+    let have;
+    try{
+      have = await api().downloaded_episodes({
+        episodes: EPISODES.map(e=>e.episode), dest: FOLDER, title: CUR_TITLE,
+        season: parseInt(document.getElementById('season').value)||1,
+        jellyfin: document.getElementById('jellyfin').checked });
+    }catch(e){ return; }
+    const set = new Set((have||[]).map(String));
+    document.querySelectorAll('.ep-row').forEach(r=>{
+      const onDisk = set.has(String(r.dataset.ep));
+      const t = r.querySelector('.ep-tag');
+      // Don't override a live download status tag.
+      if(r.classList.contains('dl-active')||r.classList.contains('dl-done')||
+         r.classList.contains('dl-failed')) return;
+      r.classList.toggle('on-disk', onDisk);
+      if(t){ if(onDisk){ t.className='ep-tag show t-disk'; t.textContent='on disk'; }
+             else if(t.classList.contains('t-disk')){ t.className='ep-tag'; t.textContent=''; } }
+    });
+  }
+  function selectMissing(){
+    SELECTED.clear();
+    document.querySelectorAll('.ep-row').forEach(r=>{
+      const i=+r.dataset.i;
+      const miss = !r.classList.contains('on-disk');
+      r.classList.toggle('sel', miss);
+      if(miss) SELECTED.add(i);
+    });
+    updateSel(); updateDlState();
+  }
 
   // ── actions ──────────────────────────────────────────
   function doSearch(){ if(!apiReady)return; api().search(document.getElementById('q').value); }
@@ -541,6 +626,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   function loadCatalog(){ if(!apiReady)return; api().load_catalog(); }
   function showBrowser(){ if(!apiReady)return; api().show_browser(); }
   function runDiagnostics(){ if(!apiReady)return; api().run_diagnostics(); }
+  function openRelease(){ if(apiReady) api().open_release(); }
+  function retryFailed(){ if(apiReady) api().retry_failed(); }
 
   document.getElementById('q').addEventListener('keydown',e=>{ if(e.key==='Enter')doSearch(); });
 
@@ -614,6 +701,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       hintEl.className = 'folder-hint' + (res.ok ? ' ok' : (res.hint ? ' bad' : ''));
     }catch(e){}
     updateDlState();
+    refreshDownloaded();   // folder changed → re-check what's already on disk
   }
   // debounce typing on the folder field (script runs at end of <body>, so the
   // element already exists)
@@ -622,6 +710,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
     if(el) el.addEventListener('input',()=>{
       clearTimeout(_folderTimer);
       _folderTimer=setTimeout(()=>setFolder(el.value), 350);
+    });
+    // Re-check the on-disk state when the season or naming scheme changes.
+    ['season','jellyfin'].forEach(id=>{
+      const x=document.getElementById(id);
+      if(x) x.addEventListener('change', ()=>refreshDownloaded());
     });
   })();
 
@@ -650,6 +743,56 @@ INDEX_HTML = r"""<!DOCTYPE html>
   function escapeHtml(s){ return (s||'').replace(/[&<>"']/g,c=>(
     {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+  // ── batch queue rendering ────────────────────────────
+  const _TAG = {downloading:['t-active','downloading'], done:['t-done','done'],
+                failed:['t-failed','failed'], skipped:['t-skip','skipped']};
+  function applyBatch(b){
+    const items = b.items || [];
+    const bar = document.getElementById('batchBar');
+    if(!items.length){ bar.classList.remove('show'); return; }
+    let done=0, failed=0, active=0;
+    items.forEach(it=>{
+      if(it.status==='done'||it.status==='skipped') done++;
+      else if(it.status==='failed') failed++;
+      else if(it.status==='downloading') active++;
+      const row = document.querySelector(`.ep-row[data-ep="${CSS.escape(String(it.ep))}"]`);
+      if(!row) return;
+      row.classList.remove('dl-active','dl-done','dl-failed','dl-skipped','on-disk');
+      const t = row.querySelector('.ep-tag'); if(!t) return;
+      const map = _TAG[it.status];
+      if(it.status==='downloading') row.classList.add('dl-active');
+      else if(it.status==='done') row.classList.add('dl-done');
+      else if(it.status==='failed') row.classList.add('dl-failed');
+      else if(it.status==='skipped') row.classList.add('dl-skipped');
+      if(map){ t.className='ep-tag show '+map[0]; t.textContent=map[1]; }
+      else { t.className='ep-tag'; t.textContent=''; }
+    });
+    bar.classList.add('show');
+    document.getElementById('batchSummary').innerHTML =
+      `<span class="bcount">${done}/${items.length}</span> done`
+      + (failed?` · <span class="bfail">${failed} failed</span>`:'')
+      + (active?` · ${active} downloading`:'');
+    const sz = b.bytes||0, est = b.estimate||0;
+    document.getElementById('batchSize').textContent =
+      sz>0 ? (fmtGB(sz) + (est>sz ? ' / ~'+fmtGB(est) : '')) : '';
+    document.getElementById('btnRetry').classList.toggle('show', failed>0 && !b.downloading);
+  }
+  function fmtGB(bytes){ const gb=bytes/1073741824;
+    return gb>=1 ? gb.toFixed(2)+' GB' : (bytes/1048576).toFixed(0)+' MB'; }
+
+  let _updateShown=false, _verShown=false;
+  async function refreshAppInfo(){
+    try{
+      const a = await api().app_info();
+      if(!_verShown && a.version){ document.getElementById('verLabel').textContent='v'+a.version; _verShown=true; }
+      if(!_updateShown && a.update && a.update.newer){
+        const c=document.getElementById('updateChip');
+        c.textContent='⬆ v'+a.update.latest+' available';
+        c.classList.add('show'); _updateShown=true;
+      }
+    }catch(e){}
+  }
+
   // ── polling for status / progress / engine ───────────
   async function poll(){
     if(apiReady){
@@ -661,12 +804,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         const p=await api().poll_progress();
         document.getElementById('progFill').style.width=(p.value||0)+'%';
+        document.getElementById('progText').textContent = p.label || '';
 
         const e=await api().engine_state();
         const dot=document.getElementById('engineDot');
         dot.className='dot'+(e.ready?' ready':'')+(e.dot==='error'?' error':'');
         document.getElementById('engineTxt').textContent=
           e.dot==='minimized'?'ready':e.dot;
+
+        const b=await api().poll_batch();
+        applyBatch(b);
+
         // re-enable download button when a run finishes
         if(p.value>=100 || (s.msg&&s.msg.startsWith('Done'))){
           document.getElementById('btnStop').disabled=true;
@@ -677,6 +825,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     setTimeout(poll, 600);
   }
   poll();
+  setInterval(refreshAppInfo, 3000); refreshAppInfo();
 </script>
 </body>
 </html>

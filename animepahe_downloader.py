@@ -41,7 +41,8 @@ import re, time, json
 
 from pahe_engine import (
     _log, _cleanup_playwright_artifacts, get_engine, shutdown_engine, pw_get,
-    BASE_URL, API_URL, RateLimited, load_settings, save_settings,
+    BASE_URL, API_URL, APP_VERSION, GITHUB_REPO, RateLimited,
+    load_settings, save_settings, check_for_update,
 )
 from pahe_scrape import (
     search_anime, filter_catalog, fetch_latest, fetch_catalog, fetch_episodes,
@@ -78,6 +79,12 @@ class Api:
         self._catalog = []            # full A-Z catalog, cached to widen search
         self._current_title = ""
         self._engine_dot = "starting"
+        # Per-episode batch state the JS polls to render the queue panel.
+        self._batch = []              # [{ep, status}]
+        self._batch_bytes = 0         # cumulative bytes saved this batch
+        self._batch_est = 0           # projected total bytes for the batch
+        self._last_dl = None          # last batch options, for retrying failures
+        self._update_info = None      # {latest, url, newer} once checked
 
     # ── wiring ────────────────────────────────────────────────────────────────
     def _set_status(self, msg, kind="info"):
@@ -87,11 +94,26 @@ class Api:
     def _set_progress(self, value, label=""):
         self._progress = {"value": round(value, 1), "label": label}
 
+    def _set_ep_status(self, ep, status):
+        for item in self._batch:
+            if item["ep"] == ep:
+                item["status"] = status
+                break
+
     def poll_status(self):
         return self._status
 
     def poll_progress(self):
         return self._progress
+
+    def poll_batch(self):
+        """Per-episode queue state + running size totals for the batch panel."""
+        return {"items": self._batch, "bytes": self._batch_bytes,
+                "estimate": self._batch_est, "downloading": self._downloading}
+
+    def app_info(self):
+        """Version + update banner info for the UI."""
+        return {"version": APP_VERSION, "update": self._update_info}
 
     def engine_state(self):
         return {"ready": self._engine_ready, "dot": self._engine_dot}
@@ -309,6 +331,85 @@ class Api:
         threading.Thread(target=run, daemon=True).start()
         return True
 
+    def downloaded_episodes(self, payload):
+        """
+        Given the current folder/season/naming and a list of {ep, title}, return
+        the episode numbers already present on disk. The UI uses this to grey out
+        episodes you already have and to power the "Select missing" button.
+        """
+        dest = (payload.get("dest") or "").strip()
+        if not dest or not os.path.isdir(dest):
+            return []
+        season = int(payload.get("season", 1) or 1)
+        jellyfin = bool(payload.get("jellyfin", True))
+        title = payload.get("title") or self._current_title
+        have = []
+        for ep in payload.get("episodes", []):
+            try:
+                if existing_episode(dest, title, season, ep, jellyfin):
+                    have.append(ep)
+            except Exception:
+                pass
+        return have
+
+    # ── update check ─────────────────────────────────────────────────────────────
+    def check_update(self):
+        """Look up the latest GitHub release in the background; the UI reads the
+        result via app_info() and shows a banner if a newer version exists."""
+        def run():
+            info = check_for_update()
+            if info:
+                self._update_info = info
+                if info.get("newer"):
+                    self._set_status(
+                        f"Update available: v{info['latest']} "
+                        f"(you have v{APP_VERSION}).", "warn")
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def open_release(self):
+        """Open the latest release page in the user's default browser."""
+        url = (self._update_info or {}).get("url") \
+            or f"https://github.com/{GITHUB_REPO}/releases/latest"
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception as e:
+            _log(f"UI: open_release failed {type(e).__name__}")
+        return True
+
+    # ── notifications ────────────────────────────────────────────────────────────
+    def _notify(self, title, message):
+        """Best-effort desktop notification (batch complete). Never raises."""
+        try:
+            if sys.platform.startswith("linux"):
+                import shutil, subprocess
+                if shutil.which("notify-send"):
+                    subprocess.Popen(["notify-send", "-a", "PAHE DL", title, message])
+            elif sys.platform == "darwin":
+                import subprocess
+                safe_m = message.replace('"', "'"); safe_t = title.replace('"', "'")
+                subprocess.Popen(["osascript", "-e",
+                                  f'display notification "{safe_m}" with title "{safe_t}"'])
+            elif os.name == "nt":
+                import subprocess
+                # Windows toast via PowerShell + WinRT. Best-effort; if the shell
+                # or WinRT isn't available it simply no-ops.
+                ps = (
+                    "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > $null;"
+                    "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+                    "$x=$t.GetElementsByTagName('text');"
+                    f"$x.Item(0).AppendChild($t.CreateTextNode('{title}')) > $null;"
+                    f"$x.Item(1).AppendChild($t.CreateTextNode('{message}')) > $null;"
+                    "$n=[Windows.UI.Notifications.ToastNotification]::new($t);"
+                    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('PAHE DL').Show($n);"
+                )
+                subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                                  "-Command", ps],
+                                 creationflags=0x08000000)  # CREATE_NO_WINDOW
+        except Exception as e:
+            _log(f"NOTIFY: failed {type(e).__name__}")
+
     # ── settings persistence ─────────────────────────────────────────────────────
     def load_settings(self):
         """Return the persisted UI settings (empty dict if none)."""
@@ -521,6 +622,16 @@ class Api:
         concurrency = max(1, min(3, int(payload.get("concurrency", 1) or 1)))
         batch_title = self._current_title
 
+        # Batch queue state (for the panel) + a snapshot of options so failed
+        # episodes can be retried with the same settings.
+        self._batch = [{"ep": it["ep"], "status": "queued"} for it in selected]
+        self._batch_bytes = 0
+        self._batch_est = 0
+        self._last_dl = {"episodes": list(selected), "dest": dest,
+                         "quality": quality, "audio": audio, "season": season,
+                         "jellyfin": jellyfin, "skip_existing": skip_existing,
+                         "concurrency": concurrency, "title": batch_title}
+
         self._stop_event.clear()
         self._downloading = True
         self._set_progress(0, "")
@@ -528,6 +639,15 @@ class Api:
         def run():
             import traceback
             total = len(selected)
+
+            def record_done(ep_num, size):
+                """Mark an episode done and refresh the batch's size totals."""
+                self._set_ep_status(ep_num, "done")
+                if size and size > 0:
+                    self._batch_bytes += size
+                done = sum(1 for b in self._batch if b["status"] == "done")
+                if done:
+                    self._batch_est = int(self._batch_bytes / done * total)
 
             def already_have(item, ep_num):
                 """True if this episode is already on disk (skip-existing on)."""
@@ -546,14 +666,17 @@ class Api:
                         break
                     ep_num = item["ep"]
                     if already_have(item, ep_num):
+                        self._set_ep_status(ep_num, "skipped")
                         self._set_status(f"[{idx+1}/{total}] Ep {ep_num}: already downloaded — skipping.", "info")
                         self._set_progress((idx + 1) / total * 100, f"Ep {ep_num} skipped")
                         idx += 1; continue
+                    self._set_ep_status(ep_num, "downloading")
                     print(f"\n[DL] Starting Ep {ep_num} | anime_id={item['anime_id']} | session={item['session'][:16]}…")
                     self._set_status(f"[{idx+1}/{total}] Finding download link for Ep {ep_num}…", "warn")
                     try:
                         options, scraped_title = get_download_options(item["anime_id"], item["session"])
                         if not options:
+                            self._set_ep_status(ep_num, "failed")
                             self._set_status(f"Ep {ep_num}: No download links — skipping.", "error")
                             idx += 1; continue
                         chosen = pick_download_option(options, quality, audio)
@@ -566,14 +689,29 @@ class Api:
 
                         # Real per-byte progress comes from the engine (which polls
                         # the file it's writing); we map it onto this episode's
-                        # slot of the overall bar and show live MB in the label.
+                        # slot of the overall bar and show live MB, speed and ETA.
+                        spd = {"t": time.time(), "b": 0, "rate": 0.0}
                         def file_prog(frac, downloaded=None, total_b=None, ep_done=idx):
                             overall = (ep_done + min(frac, 0.99)) / total * 100
-                            if downloaded and total_b:
-                                lbl = (f"Ep {ep_num}: {downloaded/1_048_576:.0f}/"
-                                       f"{total_b/1_048_576:.0f} MB  ({ep_done+1}/{total})")
-                            elif downloaded:
-                                lbl = f"Ep {ep_num}: {downloaded/1_048_576:.0f} MB  ({ep_done+1}/{total})"
+                            if downloaded:
+                                now = time.time()
+                                dt = now - spd["t"]
+                                if dt >= 0.4 and downloaded >= spd["b"]:
+                                    inst = (downloaded - spd["b"]) / dt
+                                    # Smooth the rate a little so it doesn't jump.
+                                    spd["rate"] = inst if spd["rate"] == 0 else spd["rate"] * 0.6 + inst * 0.4
+                                    spd["t"], spd["b"] = now, downloaded
+                                extra = ""
+                                if spd["rate"] > 0:
+                                    extra = f"  {spd['rate']/1_048_576:.1f} MB/s"
+                                    if total_b and total_b > downloaded:
+                                        eta = int((total_b - downloaded) / spd["rate"])
+                                        extra += f"  ETA {eta//60:d}:{eta%60:02d}"
+                                if total_b:
+                                    lbl = (f"Ep {ep_num}: {downloaded/1_048_576:.0f}/"
+                                           f"{total_b/1_048_576:.0f} MB{extra}  ({ep_done+1}/{total})")
+                                else:
+                                    lbl = f"Ep {ep_num}: {downloaded/1_048_576:.0f} MB{extra}  ({ep_done+1}/{total})"
                             else:
                                 lbl = f"Ep {ep_num} of {total}"
                             self._set_progress(overall, lbl)
@@ -604,9 +742,15 @@ class Api:
                                     self._set_status(f"Links throttled — waiting {r}s before retrying Ep {ep_num}…", "warn")
                                     time.sleep(1)
                                 continue
+                            self._set_ep_status(ep_num, "failed")
                             self._set_status(f"Ep {ep_num}: Could not download after retries — skipping.", "error")
                             res_strikes = 0; idx += 1; continue
                         res_strikes = 0
+                        try:
+                            saved_size = int(result[1].get("size", 0))
+                        except Exception:
+                            saved_size = 0
+                        record_done(ep_num, saved_size)
                         self._set_progress((idx + 1) / total * 100, f"Ep {ep_num} done")
                         rl_strikes = ctx_strikes = 0
                         idx += 1
@@ -629,6 +773,7 @@ class Api:
                                     self._set_status(f"Browser reset — waiting {r}s before retrying Ep {ep_num}…", "warn")
                                     time.sleep(1)
                                 continue
+                        self._set_ep_status(ep_num, "failed")
                         self._set_status(f"Ep {ep_num} error: {e}", "error")
                         idx += 1; continue
 
@@ -647,8 +792,10 @@ class Api:
                     for item in group:
                         ep_num = item["ep"]
                         if already_have(item, ep_num):
+                            self._set_ep_status(ep_num, "skipped")
                             self._set_status(f"Ep {ep_num}: already downloaded — skipping.", "info")
                             done += 1; continue
+                        self._set_ep_status(ep_num, "downloading")
                         self._set_status(f"Finding download link for Ep {ep_num}…", "warn")
                         try:
                             options, scraped = get_download_options(item["anime_id"], item["session"])
@@ -659,6 +806,7 @@ class Api:
                                 time.sleep(1)
                             options, scraped = [], ""
                         if not options:
+                            self._set_ep_status(ep_num, "failed")
                             self._set_status(f"Ep {ep_num}: No download links — skipping.", "error")
                             done += 1; continue
                         chosen = pick_download_option(options, quality, audio)
@@ -677,8 +825,10 @@ class Api:
                         for r in results:
                             done += 1
                             if r.get("ok"):
+                                record_done(r["ep"], int(r.get("size", 0)))
                                 self._set_status(f"Ep {r['ep']} done.", "success")
                             else:
+                                self._set_ep_status(r["ep"], "failed")
                                 self._set_status(f"Ep {r['ep']}: download failed.", "error")
                     self._set_progress(done / total * 100, f"{done}/{total} done")
 
@@ -689,8 +839,18 @@ class Api:
                     sequential()
 
                 if not self._stop_event.is_set():
-                    self._set_status(f"Done! {total} episode(s) saved to {dest}", "success")
+                    ok = sum(1 for b in self._batch if b["status"] in ("done", "skipped"))
+                    failed = sum(1 for b in self._batch if b["status"] == "failed")
+                    summary = f"Done! {ok}/{total} episode(s) saved to {dest}"
+                    if failed:
+                        summary += f" · {failed} failed"
+                    self._set_status(summary, "success" if not failed else "warn")
                     self._set_progress(100, "Complete")
+                    gb = self._batch_bytes / 1_073_741_824
+                    self._notify("Download complete",
+                                 f"{ok}/{total} episodes"
+                                 + (f", {failed} failed" if failed else "")
+                                 + (f" · {gb:.1f} GB" if gb >= 0.05 else ""))
             finally:
                 self._downloading = False
                 # Reclaim disk space after the batch: sweep orphaned browser
@@ -705,6 +865,29 @@ class Api:
         self._stop_event.set()
         self._set_status("Stopping after current file…", "warn")
         return True
+
+    def retry_failed(self):
+        """Re-run just the failed episodes from the last batch, with the same
+        settings. Used by the Retry button in the queue panel."""
+        if self._downloading:
+            self._set_status("A download is already running.", "warn")
+            return False
+        if not self._last_dl:
+            return False
+        failed_eps = {b["ep"] for b in self._batch if b["status"] == "failed"}
+        items = [it for it in self._last_dl["episodes"] if it["ep"] in failed_eps]
+        if not items:
+            self._set_status("No failed episodes to retry.", "info")
+            return False
+        payload = dict(self._last_dl)
+        payload["episodes"] = items
+        # Retry the actual files even if skip-existing is on (they're missing).
+        payload["skip_existing"] = False
+        # Restore the batch's series title so naming stays correct even if the
+        # user has since navigated to a different anime.
+        self._current_title = self._last_dl.get("title") or self._current_title
+        self._set_status(f"Retrying {len(items)} failed episode(s)…", "warn")
+        return self.start_download(payload)
 
 
 def _on_closed():
@@ -745,6 +928,8 @@ def main():
     def boot():
         # Wait until the bridge is ready, then start the engine.
         api.start_engine()
+        # Check GitHub for a newer release (background, best-effort).
+        api.check_update()
 
     # Use the bundled icon if we can find it (works in both source and frozen
     # builds). Not all pywebview backends honour it, so it's best-effort.

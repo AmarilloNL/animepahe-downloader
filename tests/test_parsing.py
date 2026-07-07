@@ -259,3 +259,21 @@ def test_settings_round_trip(monkeypatch, tmp_path):
 def test_load_settings_missing_file(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, "SETTINGS_PATH", tmp_path / "nope.json")
     assert engine.load_settings() == {}
+
+
+# ── version comparison (update checker) ──────────────────────────────────────
+@pytest.mark.parametrize("a,b,expected", [
+    ("2.3.0", "2.2.1", True),      # newer patch/minor
+    ("v2.3.0", "2.3.0", False),    # equal, tolerate leading v
+    ("2.2.0", "2.10.0", False),    # numeric, not lexicographic (10 > 2)
+    ("2.10.1", "2.9.9", True),
+    ("3.0.0", "2.99.99", True),
+    ("1.0", "1.0.0", False),       # short forms normalize
+])
+def test_version_tuple_ordering(a, b, expected):
+    assert (engine._version_tuple(a) > engine._version_tuple(b)) == expected
+
+
+def test_version_tuple_handles_junk():
+    assert engine._version_tuple("") == (0, 0, 0)
+    assert engine._version_tuple("v2.3.0-beta.1") == (2, 3, 0)

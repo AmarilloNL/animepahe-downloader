@@ -15,11 +15,16 @@ A desktop app to search, browse, and batch-download anime episodes from AnimePah
 - **Batch download** — select individual episodes, a range, or a whole season at once
 - **Quality and audio selection** — choose 1080p/720p/480p/360p and sub/dub when available
 - **Skip what you already have** — re-point the app at a series and it only fetches the missing episodes (matches any quality, so a 720p file already on disk won't be re-grabbed in 1080p)
+- **Knows what you already have** — episodes on disk are greyed out in the list, and a **Missing** button selects only the ones you don't have yet
+- **Batch queue view** — each episode shows a live status (downloading / done / failed) with a one-click **Retry failed**
 - **Remembers your setup** — quality, audio, naming, folder, and parallelism are restored on the next launch
-- **Live progress** — a real per-file percentage and MB counter, not just a batch position
+- **Live progress** — a real per-file percentage, MB counter, download speed, and ETA, plus a running batch size total
 - **Optional parallel downloads** — pull 2–3 episodes at once for faster batches (off by default; higher values raise the risk of a Cloudflare/Kwik block)
+- **Integrity-checked** — a download that comes up short of its expected size is discarded and retried instead of leaving a corrupt file
+- **Finish notification** — a desktop notification when a background batch completes
+- **Update aware** — checks GitHub on launch and shows a chip when a newer version is out
 - **Self-test** — one button walks the whole pipeline (API → episodes → links → resolve) and tells you exactly which step broke when the site changes
-- **Background operation** — the browser minimizes and downloads run quietly while you do other things
+- **Background operation** — the browser hides off-screen and downloads run quietly while you do other things
 - **Jellyfin/Plex naming** — optional `Series/Series - S01E01` folder structure that media servers recognize automatically, with the season number auto-guessed from the title
 - **Resilient** — backs off and retries on rate limits, throttling, and transient failures, and resumes stalled downloads
 
@@ -79,9 +84,13 @@ python3 -m pip install patchright pywebview
 python3 -m patchright install chromium
 ```
 
-### Windows — prebuilt .exe (easiest)
+### Prebuilt downloads (easiest)
 
-Grab `AnimePaheDownloader.exe` from the [Releases page](../../releases) and run it. On first launch it downloads its Chromium browser automatically (one-time), then opens. No Python install needed.
+Grab the build for your OS from the [Releases page](../../releases). On first launch it downloads its Chromium browser automatically (one-time), then opens. No Python install needed.
+
+- **Windows** — `AnimePaheDownloader.exe`.
+- **macOS (Apple Silicon)** — `AnimePaheDownloader-macos-arm64.zip`. Unzip and run the app. It's unsigned, so the first time use right-click → **Open** to get past Gatekeeper.
+- **Linux** — `AnimePaheDownloader-linux`. Mark it executable (`chmod +x`) and run it. It still needs the system WebKitGTK package installed (see the Arch/Debian commands above); the binary bundles the Python side only. If it won't start, running from source is the most reliable path on Linux.
 
 ### Windows / macOS — from source
 

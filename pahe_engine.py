@@ -20,6 +20,11 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# Bump this to match the release tag when cutting a new version. The update
+# checker compares it against the latest GitHub release.
+APP_VERSION = "2.3.0"
+GITHUB_REPO = "AmarilloNL/animepahe-downloader"
+
 BASE_URL = "https://animepahe.pw"
 API_URL  = f"{BASE_URL}/api"
 HEADERS  = {
@@ -62,6 +67,46 @@ def save_settings(data: dict) -> None:
     except Exception as e:
         _log(f"SETTINGS: save failed {type(e).__name__}")
 
+
+def _version_tuple(v: str) -> tuple:
+    """Parse '2.3.0' / 'v2.3.0' into (2,3,0) for comparison; junk parts -> 0."""
+    v = (v or "").strip().lstrip("vV")
+    parts = re.split(r"[.\-+]", v)
+    out = []
+    for p in parts[:3]:
+        m = re.match(r"\d+", p)
+        out.append(int(m.group(0)) if m else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def check_for_update(timeout: int = 6) -> dict | None:
+    """
+    Ask GitHub for the latest release and compare it to APP_VERSION. Returns
+    {"latest": "2.3.1", "url": "...", "newer": bool} or None on any failure.
+    Best-effort, no auth (public endpoint), safe to call from a background thread.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"animepahe-dl/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        tag = data.get("tag_name") or ""
+        if not tag:
+            return None
+        newer = _version_tuple(tag) > _version_tuple(APP_VERSION)
+        return {"latest": tag.lstrip("vV"),
+                "url": data.get("html_url", ""),
+                "newer": newer}
+    except Exception as e:
+        _log(f"UPDATE: check failed {type(e).__name__}")
+        return None
+
+
 def _log(msg: str):
     """Append a timestamped line to the engine log AND print it.
 
@@ -79,6 +124,19 @@ def _log(msg: str):
             pass
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Roll the log over once it gets large so it can't grow without bound
+        # over months of use. Keep one previous file (engine.log.1).
+        try:
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2_000_000:
+                bak = LOG_PATH.with_suffix(LOG_PATH.suffix + ".1")
+                try:
+                    if bak.exists():
+                        bak.unlink()
+                except OSError:
+                    pass
+                LOG_PATH.replace(bak)
+        except OSError:
+            pass
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -1057,6 +1115,17 @@ class BrowserEngine:
                         download.save_as(dest_path)
                         stop_poll.set()
                         size = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+                        # Integrity check: if we know the expected size and the
+                        # file is meaningfully short, it's truncated — delete it
+                        # and report failure so the caller retries with a fresh
+                        # link instead of leaving a corrupt MP4 on disk.
+                        if total_bytes and size < total_bytes * 0.98:
+                            _log(f"DLRES: truncated download {size}/{total_bytes} — discarding")
+                            try: os.remove(dest_path)
+                            except OSError: pass
+                            try: download.delete()
+                            except Exception: pass
+                            return None
                         if self._pending_progress:
                             self._pending_progress(1.0, size, total_bytes or size)
                         _log(f"DLRES: browser download complete ({size} bytes)")
@@ -1293,9 +1362,22 @@ class BrowserEngine:
             try:
                 os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
                 _log(f"PAR: saving ep {ep} to {dest}")
+                total = 0
+                try:
+                    head = self._ctx.request.head(dl.url, timeout=8000)
+                    total = int(head.headers.get("content-length", 0) or 0)
+                except Exception:
+                    total = 0
                 dl.save_as(dest)
                 size = os.path.getsize(dest) if os.path.exists(dest) else 0
-                results.append({"ep": ep, "path": dest, "size": size, "ok": size > 0})
+                # Reject truncated files so a corrupt MP4 isn't reported as done.
+                if total and size < total * 0.98:
+                    _log(f"PAR: ep {ep} truncated {size}/{total} — discarding")
+                    try: os.remove(dest)
+                    except OSError: pass
+                    results.append({"ep": ep, "ok": False})
+                else:
+                    results.append({"ep": ep, "path": dest, "size": size, "ok": size > 0})
                 try: dl.delete()
                 except Exception: pass
             except Exception as e:

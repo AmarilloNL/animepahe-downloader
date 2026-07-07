@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Releases
 
 on:
   push:
@@ -10,15 +10,15 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    # Pin an explicit x64 Windows runner (windows-latest can vary).
+  # ── Windows .exe (proven build) ─────────────────────────────────────────────
+  build-windows:
     runs-on: windows-2022
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python (x64)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           architecture: 'x64'
@@ -76,13 +76,110 @@ jobs:
           python -c "import struct,sys; d=open('dist/AnimePaheDownloader.exe','rb').read(); print('icon resource present' if b'\x00\x00\x01\x00' in d[:2000000] else 'NOTE: icon marker not found in header scan (may still be present)')"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: AnimePaheDownloader-windows
           path: dist/AnimePaheDownloader.exe
 
       - name: Attach EXE to the Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/AnimePaheDownloader.exe
+
+  # ── macOS .app (uses the system WKWebView, no webview bundling needed) ───────
+  build-macos:
+    runs-on: macos-14   # Apple Silicon (arm64)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build .app
+        run: |
+          pyinstaller --onefile --windowed \
+            --name "AnimePaheDownloader" \
+            --collect-all patchright \
+            --collect-all webview \
+            --collect-all bs4 \
+            --hidden-import pahe_engine \
+            --hidden-import pahe_scrape \
+            --hidden-import pahe_ui \
+            --add-data "app_icon.ico:." \
+            --add-data "icon.png:." \
+            animepahe_downloader.py
+          # Zip the .app so it can be attached as a single asset with perms intact.
+          cd dist && zip -r -y "AnimePaheDownloader-macos-arm64.zip" "AnimePaheDownloader.app"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AnimePaheDownloader-macos-arm64
+          path: dist/AnimePaheDownloader-macos-arm64.zip
+
+      - name: Attach to the Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/AnimePaheDownloader-macos-arm64.zip
+
+  # ── Linux binary (requires system webkit2gtk at runtime, like from source) ──
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install system GTK/WebKit deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1 \
+            libgirepository1.0-dev gir1.2-gtk-3.0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pygobject
+          pip install pyinstaller
+
+      - name: Build Linux binary
+        run: |
+          pyinstaller --onefile \
+            --name "AnimePaheDownloader-linux" \
+            --collect-all patchright \
+            --collect-all webview \
+            --collect-all bs4 \
+            --collect-all gi \
+            --hidden-import pahe_engine \
+            --hidden-import pahe_scrape \
+            --hidden-import pahe_ui \
+            --add-data "app_icon.ico:." \
+            --add-data "icon.png:." \
+            animepahe_downloader.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AnimePaheDownloader-linux
+          path: dist/AnimePaheDownloader-linux
+
+      - name: Attach to the Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/AnimePaheDownloader-linux
