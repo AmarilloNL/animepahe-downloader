@@ -22,7 +22,7 @@ from urllib.parse import urlencode, urlparse
 # ── Constants ─────────────────────────────────────────────────────────────────
 # Bump this to match the release tag when cutting a new version. The update
 # checker compares it against the latest GitHub release.
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 GITHUB_REPO = "AmarilloNL/animepahe-downloader"
 
 BASE_URL = "https://animepahe.pw"
@@ -277,6 +277,7 @@ class BrowserEngine:
         self._on_challenge = on_challenge   # called when a visible re-solve is needed
         self._current_headless = False      # we always start visible
         self._minimized = False             # window minimized state
+        self._worker = None                 # reused bg tab for poster/HTML fetches
         self._pending_dest = None           # dest path for browser save_as download
         self._pending_progress = None       # progress callback for the save
         self._jobs:    "queue.Queue" = queue.Queue()
@@ -612,41 +613,82 @@ class BrowserEngine:
             _log(f"WINDOW: set state={state} failed {type(e).__name__}: {str(e)[:100]}")
             return False
 
-    def _move_offscreen(self) -> bool:
+    def _ensure_worker_page(self):
         """
-        Park the window far off-screen with window state 'normal' (NOT minimized).
-        On Linux/mac a *minimized* window gets restored — flashed briefly on
-        screen — every time we open a background tab (poster/resolve fetches),
-        which is the flicker users see. A window that's merely off-screen never
-        becomes visible when a tab opens, so there's nothing to flash.
+        A single, reused background tab for poster/HTML side-fetches. Creating a
+        NEW tab is what un-minimizes the window (the search flicker); reusing one
+        tab — created once, while the window is still visible at startup — means
+        those fetches never spawn a tab and so never raise the window. Returns the
+        page, or None.
         """
+        try:
+            if self._worker is None or self._worker.is_closed():
+                self._worker = self._ctx.new_page()
+        except Exception:
+            self._worker = None
+        return self._worker
+
+    def _hide_window_linux(self) -> bool:
+        """
+        Hide the browser on Linux/mac. We MINIMIZE (window managers honor that as
+        'hide') and also park the window off-screen first, so that if a tab-open
+        later restores it, it comes back off-screen instead of flashing centre
+        stage. Off-screen ALONE isn't enough: many tiling/compositing WMs clamp
+        an off-screen window back on-screen, which is why the window stayed
+        visible. Minimize is the reliable hide; off-screen is the anti-flicker.
+        """
+        ok = False
         try:
             page = self._main_page()
             session = self._ctx.new_cdp_session(page)
             win_id = session.send("Browser.getWindowForTarget")["windowId"]
-            # Must be 'normal' before explicit bounds are accepted.
-            session.send("Browser.setWindowBounds",
-                         {"windowId": win_id, "bounds": {"windowState": "normal"}})
-            session.send("Browser.setWindowBounds", {
-                "windowId": win_id,
-                "bounds": {"left": -32000, "top": -32000, "width": 1100, "height": 760},
-            })
+            # Position off-screen (needs 'normal' state to accept bounds)…
+            try:
+                session.send("Browser.setWindowBounds",
+                             {"windowId": win_id, "bounds": {"windowState": "normal"}})
+                session.send("Browser.setWindowBounds", {
+                    "windowId": win_id,
+                    "bounds": {"left": -32000, "top": -32000, "width": 1100, "height": 760}})
+            except Exception:
+                pass
+            # …then minimize, which actually hides it on WMs that ignore position.
+            try:
+                session.send("Browser.setWindowBounds",
+                             {"windowId": win_id, "bounds": {"windowState": "minimized"}})
+                ok = True
+                _log("WINDOW: minimized (linux)")
+            except Exception as e:
+                _log(f"WINDOW: minimize failed {type(e).__name__}")
             try: session.detach()
             except Exception: pass
-            return True
         except Exception as e:
-            _log(f"WINDOW: offscreen move failed {type(e).__name__}")
-            return False
+            _log(f"WINDOW: hide failed {type(e).__name__}")
+        return ok
+
+    def _minimize_only(self):
+        """Re-minimize without touching position/normal state (so it can't
+        itself un-minimize and flash). Used by _reassert_minimized on Linux/mac."""
+        try:
+            page = self._main_page()
+            session = self._ctx.new_cdp_session(page)
+            win_id = session.send("Browser.getWindowForTarget")["windowId"]
+            session.send("Browser.setWindowBounds",
+                         {"windowId": win_id, "bounds": {"windowState": "minimized"}})
+            try: session.detach()
+            except Exception: pass
+        except Exception:
+            pass
 
     def _go_headless(self):
         """Hide the browser (same process stays alive)."""
+        # Create the reusable background tab while the window is still visible, so
+        # later poster fetches never have to spawn a tab (which would un-hide it).
+        self._ensure_worker_page()
         if os.name == "nt":
             if self._window_state("minimized"):
                 self._minimized = True
         else:
-            # Linux/mac: park off-screen instead of minimizing, so opening a
-            # background tab can't flash the window back into view.
-            if self._move_offscreen() or self._window_state("minimized"):
+            if self._hide_window_linux() or self._window_state("minimized"):
                 self._minimized = True
 
     def _go_visible(self):
@@ -819,18 +861,15 @@ class BrowserEngine:
         """
         if not url:
             return None
-        tab = None
         try:
             # Make sure the main page has cleared Cloudflare so the session is warm.
             main = self._main_page()
             if not (main.url or "").startswith(BASE_URL):
                 self._goto(main, BASE_URL)
-            tab = self._ctx.new_page()
-            # Opening a tab un-minimizes the window on Windows. Re-hide it
-            # immediately (before navigation) to keep the flash as short as
-            # possible.
-            if self._minimized:
-                self._win_hide_browser()
+            # Reuse the persistent worker tab (no new_page → no window un-hide).
+            tab = self._ensure_worker_page()
+            if tab is None:
+                return None
             resp = tab.goto(url, wait_until="commit", timeout=15000)
             if not resp or not resp.ok:
                 _log(f"IMG: goto HTTP {resp.status if resp else '?'} {url[:55]}")
@@ -844,10 +883,7 @@ class BrowserEngine:
             _log(f"IMG: fetch failed {type(e).__name__} {url[:55]}")
             return None
         finally:
-            if tab is not None:
-                try: tab.close()
-                except Exception: pass
-            # Opening/closing a tab can re-raise the window; keep it hidden.
+            # Belt-and-suspenders: if anything did raise the window, re-hide it.
             if self._minimized:
                 try: self._reassert_minimized()
                 except Exception: pass
@@ -862,19 +898,16 @@ class BrowserEngine:
         """
         if not url:
             return 0, ""
-        tab = None
         try:
-            tab = self._ctx.new_page()
-            # Opening a tab tries to raise the window — re-hide it immediately.
-            if self._minimized:
-                self._win_hide_browser()
-            self._reassert_minimized()
+            # Reuse the persistent worker tab (no new_page → no window un-hide).
+            tab = self._ensure_worker_page()
+            if tab is None:
+                return 0, ""
             resp = tab.goto(url, wait_until="commit", timeout=15000)
             try:
                 tab.wait_for_load_state("domcontentloaded", timeout=6000)
             except Exception:
                 pass
-            self._reassert_minimized()
             status = resp.status if resp else 0
             html = tab.content()
             return status, html
@@ -882,9 +915,6 @@ class BrowserEngine:
             _log(f"TABGET: failed {type(e).__name__} {url[:55]}")
             return 0, ""
         finally:
-            if tab is not None:
-                try: tab.close()
-                except Exception: pass
             if self._minimized:
                 try: self._reassert_minimized()
                 except Exception: pass
@@ -929,9 +959,9 @@ class BrowserEngine:
                     # the window from lingering visibly.
                     self._win_hide_browser()
                 else:
-                    # Re-park off-screen (not minimize) so a freshly-opened tab
-                    # can't flash the window on screen. See _move_offscreen.
-                    self._move_offscreen()
+                    # Just re-minimize — do NOT re-apply 'normal'+off-screen here,
+                    # or it would briefly un-minimize the window and flash.
+                    self._minimize_only()
             except Exception:
                 pass
 

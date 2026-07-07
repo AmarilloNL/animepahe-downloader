@@ -81,6 +81,7 @@ class Api:
         self._engine_dot = "starting"
         # Per-episode batch state the JS polls to render the queue panel.
         self._batch = []              # [{ep, status}]
+        self._batch_anime = ""        # anime_id the batch belongs to
         self._batch_bytes = 0         # cumulative bytes saved this batch
         self._batch_est = 0           # projected total bytes for the batch
         self._last_dl = None          # last batch options, for retrying failures
@@ -108,8 +109,9 @@ class Api:
 
     def poll_batch(self):
         """Per-episode queue state + running size totals for the batch panel."""
-        return {"items": self._batch, "bytes": self._batch_bytes,
-                "estimate": self._batch_est, "downloading": self._downloading}
+        return {"items": self._batch, "anime": self._batch_anime,
+                "bytes": self._batch_bytes, "estimate": self._batch_est,
+                "downloading": self._downloading}
 
     def app_info(self):
         """Version + update banner info for the UI."""
@@ -625,6 +627,7 @@ class Api:
         # Batch queue state (for the panel) + a snapshot of options so failed
         # episodes can be retried with the same settings.
         self._batch = [{"ep": it["ep"], "status": "queued"} for it in selected]
+        self._batch_anime = (selected[0].get("anime_id") or "") if selected else ""
         self._batch_bytes = 0
         self._batch_est = 0
         self._last_dl = {"episodes": list(selected), "dest": dest,

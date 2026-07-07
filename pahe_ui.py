@@ -750,11 +750,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     const items = b.items || [];
     const bar = document.getElementById('batchBar');
     if(!items.length){ bar.classList.remove('show'); return; }
+    // Only paint per-episode status onto the list when we're actually looking at
+    // the anime this batch belongs to — otherwise a previous show's statuses
+    // would bleed onto a different anime's episodes (e.g. showing EP1-12 "done").
+    const curAnime = EPISODES.length ? EPISODES[0].anime_id : null;
+    const sameAnime = b.anime && curAnime && b.anime === curAnime;
     let done=0, failed=0, active=0;
     items.forEach(it=>{
       if(it.status==='done'||it.status==='skipped') done++;
       else if(it.status==='failed') failed++;
       else if(it.status==='downloading') active++;
+      if(!sameAnime) return;   // count totals, but don't tag another anime's rows
       const row = document.querySelector(`.ep-row[data-ep="${CSS.escape(String(it.ep))}"]`);
       if(!row) return;
       row.classList.remove('dl-active','dl-done','dl-failed','dl-skipped','on-disk');
@@ -767,6 +773,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       if(map){ t.className='ep-tag show '+map[0]; t.textContent=map[1]; }
       else { t.className='ep-tag'; t.textContent=''; }
     });
+    // Show the summary bar while downloading (global progress) or while viewing
+    // the batch's own anime; hide a finished batch when browsing a different show.
+    if(!sameAnime && !b.downloading){ bar.classList.remove('show'); return; }
     bar.classList.add('show');
     document.getElementById('batchSummary').innerHTML =
       `<span class="bcount">${done}/${items.length}</span> done`
